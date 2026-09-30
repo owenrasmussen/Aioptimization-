@@ -1,0 +1,4 @@
+pynvml
+gguf
+numpy
+pytest
