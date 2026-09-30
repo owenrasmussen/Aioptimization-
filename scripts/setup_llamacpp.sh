@@ -22,7 +22,13 @@ git -C "$DEST" rev-parse HEAD > "$PIN_FILE"
 echo "Pinned llama.cpp at $(cat "$PIN_FILE") (recorded in LLAMACPP_COMMIT; commit that file)"
 
 # 86 = Ampere consumer cards (3080 Ti)
-cmake -S "$DEST" -B "$DEST/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
+# The *_RELEASE/_DEBUG overrides stop multi-config generators (Visual Studio on
+# Windows) from appending a config subfolder, so binaries always land directly
+# in build/bin as harness/*.py's --bin-dir default expects.
+cmake -S "$DEST" -B "$DEST/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$DEST/build/bin" \
+  -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE="$DEST/build/bin" \
+  -DCMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG="$DEST/build/bin"
 cmake --build "$DEST/build" --config Release -j \
   --target llama-bench llama-perplexity llama-quantize llama-server llama-imatrix
 
