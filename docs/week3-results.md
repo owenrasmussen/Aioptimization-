@@ -149,11 +149,45 @@ with independent article selection rather than shared quotes).
 `--eval-split held_out` without `--allow-held-out` is refused at
 argument-parsing time, before any model is built or server started.
 
-All 58 unit tests pass (`pytest tests/`), covering spec/db behavior from
+All 60 unit tests pass (`pytest tests/`), covering spec/db behavior from
 Weeks 1-2 plus this week's splits chokepoints, the resource sampler, the
 needle/multi-hop generators, `LlamaServer.build_cmd`'s `-np 1`/`--fit off`
 regression coverage, and the GSM8K/HumanEval helper functions -- all without
 needing a GPU or network access.
+
+## A first real comparison: does KV cache precision cost anything?
+
+With the quality suite actually working, it's worth pointing it at the
+question Week 2 only had KL and speed/VRAM data for. Same Q4_K_M weights
+(one cached artifact, per Week 2's two-hash scheme), f16 vs. q8_0 KV cache,
+largest-sample result per metric from the runs above:
+
+| Metric | KV f16 | KV q8_0 | Difference |
+| --- | --- | --- | --- |
+| KL mean vs. Q8_0 weights | 5.996 | 6.014 | ~0 |
+| GSM8K (n=30) | 0.667 ± 0.088 | 0.633 ± 0.089 | within 1 stderr |
+| HumanEval (n=30) | 0.633 ± 0.088 | 0.633 ± 0.088 | **identical** |
+| Needle @ 8k/16k/32k (n=6 each) | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 | none |
+| Multi-hop @ 8k/16k/32k (n=4 each) | 0.00 / 0.25 / 0.00 | 0.00 / 0.25 / 0.00 | none |
+
+Every quality metric tracks the other KV config within noise, at every
+context length tested, while Week 2 already measured q8_0 KV cache as both
+faster (3825 vs. 2426 t/s prompt processing at this size) and lighter on
+VRAM (2.68 vs. 2.98 GB). On this model and this range, there's no detected
+quality cost to q8_0 KV cache -- which is itself informative for the
+project's central question (weights vs. KV cache budget at a fixed memory
+limit): spending the saved VRAM on bigger weights, not on keeping KV at
+f16, looks like the right call so far.
+
+Caveats, stated plainly rather than buried: sample sizes are small (n=30 for
+the task suite, n=4-6 per long-context cell) -- these are "the harness
+produces a believable signal" numbers, not publication-grade confidence
+intervals. Multi-hop's 8k/16k/32k pattern (0.00/0.25/0.00) is not
+monotonic, which with n=4 is well within a couple of items flipping by
+chance, not a claim that 16k context is special. And this is one model
+family at one weight quant -- the real experiment (per `docs/plan.md`
+section 7) sweeps weight quant **and** KV precision together across model
+families, which is Week 5-6 territory, not this week's.
 
 ## What's next
 
