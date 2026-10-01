@@ -46,9 +46,25 @@ def run(cmd: list[str], log_path: Path) -> subprocess.CompletedProcess:
 
 
 def kv_flags(spec: CandidateSpec) -> list[str]:
-    """-ctk/-ctv/-fa flags, same syntax for llama-bench and llama-perplexity."""
+    """-ctk/-ctv/-fa flags, same syntax for llama-bench, llama-perplexity and llama-server."""
     fa = "on" if spec.flash_attn else "off"
     return ["-ctk", spec.kv_type_k, "-ctv", spec.kv_type_v, "-fa", fa]
+
+
+def spec_flags(spec: CandidateSpec) -> list[str]:
+    """kv_flags() plus -b/-ub when set -- the one place every llama.cpp tool
+    invocation builds its spec-derived flags, so a KV type or batch size can't
+    drift between bench/KL/server the way KL alone once missed KV flags.
+
+    spec.engine_flags are deliberately NOT included: append them separately
+    at the call site, since their syntax isn't guaranteed valid on every
+    binary (llama-bench accepts flags the server doesn't, and vice versa)."""
+    flags = kv_flags(spec)
+    if spec.batch_size:
+        flags += ["-b", str(spec.batch_size)]
+    if spec.ubatch_size:
+        flags += ["-ub", str(spec.ubatch_size)]
+    return flags
 
 
 def quantize(src: Path, dst: Path, quant: str, log_path: Path, bin_dir: str | None = None) -> float:

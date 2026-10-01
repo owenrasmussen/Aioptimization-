@@ -1,15 +1,24 @@
-"""Week 2 orchestrator: a candidate spec goes in, a result record comes out.
+"""The orchestrator: a candidate spec goes in, a result record comes out.
 
 python -m harness.run specs/example.json --repeats 5 --pp 512 --tg 128 \\
-    --max-temp 45 --kld-ref models/qwen2.5-3b-instruct-Q8_0.gguf --kld-text data/dev.txt
+    --max-temp 45 --kld-ref models/qwen2.5-3b-instruct-Q8_0.gguf --kld-text data/dev.txt \\
+    --lm-eval-tasks gsm8k,humaneval --run-longctx
 
 For each spec: build (or reuse, from the artifact cache keyed by artifact_hash)
 the quantized model, measure pp and tg speed as separate llama-bench
 invocations (so each phase's sampled energy belongs to that phase, not a
 load+pp+tg blend), measure KL divergence against a fixed reference model with
-the spec's own KV-cache flags applied, and write both a raw JSON result
-record (results/runs/<id>/record.json, the source of truth) and rows into the
-DuckDB store (results/runs.duckdb, a rebuildable summary of those records).
+the spec's own KV-cache flags applied, optionally run a task suite
+(GSM8K/HumanEval, via harness.lmeval) and the long-context suite
+(needle/multi-hop, via harness.longctx) against a real llama-server, and write
+both a raw JSON result record (results/runs/<id>/record.json, the source of
+truth) and rows into the DuckDB store (results/runs.duckdb, a rebuildable
+summary of those records).
+
+Every quality measure that reads free text (KL, the long-context haystack) or
+task docs (lm-eval) goes through harness.splits' chokepoints first, which
+classify the input by content hash against data/splits.json and refuse the
+held-out split without --allow-held-out.
 """
 from __future__ import annotations
 
@@ -21,7 +30,8 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-from harness import db, gpu, llama, memory
+from harness import db, gpu, llama, lmeval, longctx, memory, splits
+from harness.server import LlamaServer, ServerFailed
 from harness.spec import CandidateSpec
 
 
@@ -105,23 +115,26 @@ def measure_bench(spec: CandidateSpec, artifact_path: Path, kind: str, pp: int, 
     return entry
 
 
-def measure_kld(spec: CandidateSpec, artifact_path: Path, ref: Path, text: Path, ctx: int,
-                 chunks: int | None, cache_dir: Path, run_dir: Path, max_temp: int,
-                 bin_dir: str) -> dict:
-    text_hash = hashlib.sha256(text.read_bytes()).hexdigest()[:16]
-    workload = {"kind": "kld", "ref": ref.name, "prompt_set_hash": text_hash,
+def measure_kld(spec: CandidateSpec, artifact_path: Path, ref: Path, text: Path, text_hash: str,
+                 split: str, ctx: int, chunks: int | None, cache_dir: Path, run_dir: Path,
+                 max_temp: int, bin_dir: str) -> dict:
+    workload = {"kind": "kld", "ref": ref.name, "prompt_set_hash": text_hash, "split": split,
                 "input_len": ctx, "output_len": 0, "concurrency": 1, "chunks": chunks}
     workload_id = _hash_dict(workload)
     entry, log_path = _new_run_entry(workload_id, workload, 0, run_dir, "kld", max_temp)
     t0 = time.monotonic()
-    ref_base = cache_dir / f"ref_{ref.stem}_c{ctx}.kld"
+    # Keyed on ref+text+ctx+chunks: a reference-logits file is only valid for the
+    # exact (model, text, ctx, chunks) it was built from. Missing the text/chunks
+    # from this key was a real bug -- pointing --kld-text at a different file with
+    # the same --kld-ref would have silently reused the wrong reference logits.
+    ref_base = cache_dir / f"ref_{ref.stem}_{text_hash}_c{ctx}_n{chunks or 0}.kld"
     try:
         llama.reference_logits(ref, text, ctx, ref_base, chunks=chunks, bin_dir=bin_dir)
         with gpu.Sampler() as sampler:
-            kld = llama.kl_divergence(artifact_path, ref_base, text, ctx, llama.kv_flags(spec), log_path,
+            kld = llama.kl_divergence(artifact_path, ref_base, text, ctx, llama.spec_flags(spec), log_path,
                                        chunks=chunks, bin_dir=bin_dir)
         entry["wall_seconds"] = time.monotonic() - t0
-        entry["quality"] = {"eval_name": "kld", "split": "dev", "score": kld.get("ppl"),
+        entry["quality"] = {"eval_name": "kld", "split": split, "score": kld.get("ppl"),
                              "kl_mean": kld.get("kld_mean"), "kl_p99": kld.get("kld_p99"),
                              "kl_max": kld.get("kld_max"), "top1_agree_pct": kld.get("top1_agree_pct")}
         entry["resources"] = sampler.summary()
@@ -129,6 +142,127 @@ def measure_kld(spec: CandidateSpec, artifact_path: Path, ref: Path, text: Path,
         entry["status"] = "failed"
         entry["failure"] = {"type": "kld", "message": str(e), "log_path": str(e.log_path)}
     return entry
+
+
+def _load_eval_text(path: Path, allow_held_out: bool) -> tuple[str, str, str]:
+    """Wraps splits.load_eval_text, falling back to treating the file as
+    unclassified ("adhoc") if data/splits.json doesn't exist yet (e.g. a
+    fresh clone before scripts/fetch_wiki.py has run) -- there's nothing to
+    protect against yet in that case, so this degrades safely rather than
+    hard-failing Week 1/2-style usage."""
+    try:
+        manifest = splits.load_manifest()
+    except FileNotFoundError:
+        text = path.read_text(encoding="utf-8")
+        return text, "adhoc", hashlib.sha256(text.encode()).hexdigest()[:16]
+    return splits.load_eval_text(path, manifest, allow_held_out)
+
+
+def measure_lm_eval(spec: CandidateSpec, artifact_path: Path, tasks: list[str], eval_split: str,
+                     allow_held_out: bool, limit: int | None, run_dir: Path, max_temp: int,
+                     bin_dir: str) -> list[dict]:
+    """One short-context server (GSM8K/HumanEval need only a few thousand
+    tokens of context, nowhere near the long-context suite's needs), one
+    quality run entry per task."""
+    server_ctx = 4096
+    try:
+        manifest = splits.load_manifest()
+    except FileNotFoundError:
+        manifest = None
+
+    entries = []
+    try:
+        with LlamaServer(artifact_path, spec, server_ctx, run_dir / "lmeval_server.log",
+                          bin_dir=bin_dir) as server:
+            for task in tasks:
+                split_used = eval_split
+                indices = None
+                if manifest is not None:
+                    try:
+                        indices = splits.task_doc_indices(task, eval_split, manifest, allow_held_out, limit)
+                    except KeyError:
+                        split_used = "unsplit"
+                if manifest is None or split_used == "unsplit":
+                    split_used = "unsplit"
+                    indices = list(range(limit)) if limit else None
+
+                workload = {"kind": "lmeval", "task": task, "split": split_used,
+                            "concurrency": 1, "server_n_ctx": server_ctx,
+                            "n_items": len(indices) if indices is not None else None}
+                entry, task_log = _new_run_entry(_hash_dict(workload), workload, 0, run_dir,
+                                                  f"lmeval_{task}", max_temp)
+                t0 = time.monotonic()
+                try:
+                    with gpu.Sampler() as sampler:
+                        if task == "humaneval":
+                            q = lmeval.evaluate_humaneval(server, indices, run_dir / "quality")
+                        else:
+                            q = lmeval.evaluate_gsm8k(server.base_url, spec.spec_hash, indices,
+                                                       run_dir / "quality")
+                    entry["wall_seconds"] = time.monotonic() - t0
+                    entry["quality"] = {**q, "split": split_used}
+                    entry["resources"] = sampler.summary()
+                except Exception as e:
+                    entry["status"] = "failed"
+                    entry["failure"] = {"type": "lmeval", "message": str(e), "log_path": str(task_log)}
+                entries.append(entry)
+    except ServerFailed as e:
+        for task in tasks:
+            workload = {"kind": "lmeval", "task": task, "split": eval_split}
+            entry, _ = _new_run_entry(_hash_dict(workload), workload, 0, run_dir,
+                                       f"lmeval_{task}_serverfail", max_temp)
+            entry["status"] = "failed"
+            entry["failure"] = {"type": "server", "message": str(e), "log_path": str(e.log_path)}
+            entries.append(entry)
+    return entries
+
+
+def measure_longctx(spec: CandidateSpec, artifact_path: Path, lengths: list[int], haystack_text: str,
+                     text_split: str, seeds: tuple[int, ...], run_dir: Path, max_temp: int,
+                     bin_dir: str) -> list[dict]:
+    paras = longctx.paragraphs_from_text(haystack_text)
+    server_ctx = max(lengths) + 512  # headroom for the question and the generation
+
+    try:
+        with LlamaServer(artifact_path, spec, server_ctx, run_dir / "longctx_server.log",
+                          bin_dir=bin_dir) as server:
+            para_tokens = longctx.tokenize_paragraphs(paras, server.tokenize)
+            trials = longctx.make_trials(paras, para_tokens, lengths, seeds=seeds)
+            out_jsonl = run_dir / "quality" / "longctx_trials.jsonl"
+            summary = longctx.run_trials(server, trials, out_jsonl)
+    except ServerFailed as e:
+        entries = []
+        for length in lengths:
+            for kind in ("needle", "multihop"):
+                eval_name = f"{kind}_{length}"
+                workload = {"kind": "longctx", "eval_name": eval_name, "split": text_split}
+                entry, _ = _new_run_entry(_hash_dict(workload), workload, 0, run_dir,
+                                           f"longctx_{eval_name}_serverfail", max_temp)
+                entry["status"] = "failed"
+                entry["failure"] = {"type": "server", "message": str(e), "log_path": str(e.log_path)}
+                entries.append(entry)
+        return entries
+
+    # Recorded after the suite runs, not before each trial -- unlike bench/KL,
+    # this is a quality-only measurement and isn't thermal-sensitive, so one
+    # wait_for_cool before the server starts (not threaded through every trial)
+    # is an acceptable simplification.
+    entries = []
+    for eval_name, s in summary.items():
+        length = int(eval_name.rsplit("_", 1)[1])
+        workload = {"kind": "longctx", "eval_name": eval_name, "split": text_split,
+                    "input_len": length, "output_len": 32, "concurrency": 1,
+                    "server_n_ctx": server_ctx, "seeds": list(seeds)}
+        entry, _ = _new_run_entry(_hash_dict(workload), workload, 0, run_dir, f"longctx_{eval_name}", max_temp)
+        entry["quality"] = {"eval_name": eval_name, "split": text_split, "score": s["score"],
+                             "n_items": s["n"],
+                             "details": {"n_correct": s["n_correct"],
+                                         "prompt_tokens_mean": s["prompt_tokens_mean"],
+                                         "prompt_tokens_min": s["prompt_tokens_min"],
+                                         "prompt_tokens_max": s["prompt_tokens_max"],
+                                         "trials_path": str(out_jsonl)}}
+        entries.append(entry)
+    return entries
 
 
 def run_spec(spec_path: Path, args: argparse.Namespace) -> dict:
@@ -146,11 +280,7 @@ def run_spec(spec_path: Path, args: argparse.Namespace) -> dict:
     stable = gpu.stable_env(env, commit)
     env_id = _hash_dict(stable)
 
-    extra_flags = llama.kv_flags(spec) + list(spec.engine_flags)
-    if spec.batch_size:
-        extra_flags += ["-b", str(spec.batch_size)]
-    if spec.ubatch_size:
-        extra_flags += ["-ub", str(spec.ubatch_size)]
+    extra_flags = llama.spec_flags(spec) + list(spec.engine_flags)
 
     runs = []
     for kind, pp, tg in (("bench_pp", args.pp, 0), ("bench_tg", 0, args.tg)):
@@ -169,12 +299,28 @@ def run_spec(spec_path: Path, args: argparse.Namespace) -> dict:
             break
 
     if not args.no_kld:
-        runs.append(measure_kld(spec, artifact_path, Path(args.kld_ref), Path(args.kld_text),
-                                 args.kld_ctx, args.kld_chunks, Path(args.cache_dir), run_dir,
+        kld_path = Path(args.kld_text)
+        # The chokepoint: classifies kld_path by its actual content hash (never
+        # by the --kld-text string itself) and raises if it's the held-out
+        # split, or leaks held-out paragraphs, without --allow-held-out.
+        _, kld_split, kld_text_hash = _load_eval_text(kld_path, args.allow_held_out)
+        runs.append(measure_kld(spec, artifact_path, Path(args.kld_ref), kld_path, kld_text_hash,
+                                 kld_split, args.kld_ctx, args.kld_chunks, Path(args.cache_dir), run_dir,
                                  args.max_temp, args.bin_dir))
 
+    if args.lm_eval_tasks:
+        runs += measure_lm_eval(spec, artifact_path, args.lm_eval_tasks, args.eval_split,
+                                 args.allow_held_out, args.lm_eval_limit, run_dir, args.max_temp,
+                                 args.bin_dir)
+
+    if args.run_longctx:
+        haystack_path = Path(args.longctx_text or args.kld_text)
+        haystack_text, longctx_split, _ = _load_eval_text(haystack_path, args.allow_held_out)
+        runs += measure_longctx(spec, artifact_path, args.longctx_lengths, haystack_text, longctx_split,
+                                 tuple(range(args.longctx_seeds)), run_dir, args.max_temp, args.bin_dir)
+
     record = {
-        "record_version": 1, "spec_hash": spec_hash, "artifact_hash": artifact_hash, "env_id": env_id,
+        "record_version": 2, "spec_hash": spec_hash, "artifact_hash": artifact_hash, "env_id": env_id,
         "spec": spec.to_dict(),
         "artifact": {**artifact, "n_params": n_params, "bpw": bpw},
         "environment": stable,
@@ -207,10 +353,27 @@ def main() -> None:
     ap.add_argument("--kld-text", help="eval text file (required unless --no-kld)")
     ap.add_argument("--kld-ctx", type=int, default=512)
     ap.add_argument("--kld-chunks", type=int, default=50)
+    ap.add_argument("--eval-split", choices=list(splits.SPLITS), default="dev",
+                     help="which split's docs to use for lm-eval tasks (default: dev)")
+    ap.add_argument("--allow-held-out", action="store_true",
+                     help="required to read the held-out split or task docs -- final reporting only")
+    ap.add_argument("--lm-eval-tasks", default="",
+                     help="comma-separated lm-eval tasks to run, e.g. gsm8k,humaneval (default: none)")
+    ap.add_argument("--lm-eval-limit", type=int, default=None,
+                     help="cap docs per task (fast iteration); omit for the full configured split")
+    ap.add_argument("--run-longctx", action="store_true", help="run the needle/multi-hop long-context suite")
+    ap.add_argument("--longctx-lengths", type=int, nargs="+", default=[8192, 16384, 32768])
+    ap.add_argument("--longctx-seeds", type=int, default=2, help="number of seeds per (kind, length)")
+    ap.add_argument("--longctx-text", help="haystack text file (default: --kld-text)")
     args = ap.parse_args()
+    args.lm_eval_tasks = [t.strip() for t in args.lm_eval_tasks.split(",") if t.strip()]
 
     if not args.no_kld and not (args.kld_ref and args.kld_text):
         ap.error("--kld-ref and --kld-text are required unless --no-kld")
+    if args.run_longctx and not (args.longctx_text or args.kld_text):
+        ap.error("--run-longctx needs --longctx-text or --kld-text to source the haystack")
+    if args.eval_split == "held_out" and not args.allow_held_out:
+        ap.error("--eval-split held_out requires --allow-held-out")
 
     for spec_path in args.specs:
         run_spec(Path(spec_path), args)

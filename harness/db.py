@@ -118,6 +118,9 @@ CREATE TABLE IF NOT EXISTS quality (
   kl_p99         DOUBLE,
   kl_max         DOUBLE,
   top1_agree_pct DOUBLE,
+  n_items        INTEGER,
+  stderr         DOUBLE,
+  details        JSON,
   PRIMARY KEY (run_id, eval_name)
 );
 
@@ -128,6 +131,17 @@ CREATE TABLE IF NOT EXISTS failures (
   log_path VARCHAR,
   PRIMARY KEY (run_id, type)
 );
+
+-- Mirrors data/splits.json (the source of truth -- see harness/splits.py).
+-- Populated by sync_split_files() on every connect(), not by insert_record(),
+-- so a `rebuild()` (which deletes this .duckdb file) can't lose the held-out
+-- lock: the manifest file survives, and the next connect() resyncs it.
+CREATE TABLE IF NOT EXISTS split_files (
+  name       VARCHAR PRIMARY KEY,   -- 'search' | 'dev' | 'held_out'
+  path       VARCHAR NOT NULL,
+  sha256     VARCHAR NOT NULL,
+  locked_at  TIMESTAMP
+);
 """
 
 
@@ -135,7 +149,24 @@ def connect(path: str = DB_PATH) -> duckdb.DuckDBPyConnection:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(path)
     con.execute(_SCHEMA)
+    sync_split_files(con)
     return con
+
+
+def sync_split_files(con: duckdb.DuckDBPyConnection, manifest_path: str | Path = None) -> None:
+    """Mirrors data/splits.json into split_files. A no-op if the manifest
+    doesn't exist yet (e.g. a fresh clone before scripts/fetch_wiki.py has run)."""
+    from harness.splits import MANIFEST_PATH
+
+    manifest_path = Path(manifest_path) if manifest_path else MANIFEST_PATH
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text())
+    for name, entry in manifest.get("text", {}).items():
+        con.execute(
+            "INSERT OR REPLACE INTO split_files VALUES (?,?,?,?)",
+            [name, entry["path"], entry["sha256"], entry.get("locked_at")],
+        )
 
 
 def insert_record(con: duckdb.DuckDBPyConnection, record: dict) -> None:
@@ -198,9 +229,10 @@ def insert_record(con: duckdb.DuckDBPyConnection, record: dict) -> None:
         if r.get("quality"):
             q = r["quality"]
             con.execute(
-                "INSERT OR REPLACE INTO quality VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO quality VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 [r["run_id"], q.get("eval_name", "kld"), q.get("split", "dev"), q.get("score"),
-                 q.get("kl_mean"), q.get("kl_p99"), q.get("kl_max"), q.get("top1_agree_pct")],
+                 q.get("kl_mean"), q.get("kl_p99"), q.get("kl_max"), q.get("top1_agree_pct"),
+                 q.get("n_items"), q.get("stderr"), json.dumps(q.get("details")) if q.get("details") else None],
             )
         if r.get("failure"):
             f = r["failure"]

@@ -43,7 +43,70 @@ def test_schema_creates_cleanly(tmp_path):
     con = db.connect(str(tmp_path / "test.duckdb"))
     tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
     assert tables == {"specs", "artifacts", "environments", "workloads", "runs", "speed",
-                       "resources", "quality", "failures"}
+                       "resources", "quality", "failures", "split_files"}
+    con.close()
+
+
+def test_quality_row_with_week3_columns(tmp_path):
+    con = db.connect(str(tmp_path / "test.duckdb"))
+    record = _sample_record()
+    record["runs"][0]["quality"] = {
+        "eval_name": "gsm8k", "split": "dev", "score": 0.42, "n_items": 50, "stderr": 0.07,
+        "details": {"metric": "exact_match,flexible-extract"},
+    }
+    db.insert_record(con, record)
+    row = con.execute(
+        "SELECT score, n_items, stderr, details FROM quality WHERE run_id='run1' AND eval_name='gsm8k'"
+    ).fetchone()
+    assert row[0] == 0.42
+    assert row[1] == 50
+    assert row[2] == 0.07
+    assert json.loads(row[3])["metric"] == "exact_match,flexible-extract"
+    con.close()
+
+
+def test_sync_split_files_mirrors_manifest(tmp_path):
+    manifest_path = tmp_path / "splits.json"
+    manifest_path.write_text(json.dumps({
+        "version": 1,
+        "text": {
+            "dev": {"path": "data/dev.txt", "sha256": "abc123"},
+            "held_out": {"path": "data/held_out.txt", "sha256": "def456", "locked_at": "2026-10-01T00:00:00"},
+        },
+        "tasks": {},
+    }))
+    con = db.connect(str(tmp_path / "test.duckdb"))
+    db.sync_split_files(con, manifest_path)
+    rows = {r[0]: r[1:] for r in con.execute("SELECT name, path, sha256 FROM split_files").fetchall()}
+    assert rows["dev"] == ("data/dev.txt", "abc123")
+    assert rows["held_out"] == ("data/held_out.txt", "def456")
+    con.close()
+
+
+def test_split_files_survives_rebuild(tmp_path):
+    # The whole point: rebuild() deletes the .duckdb file, but the manifest
+    # lives in a separate file (data/splits.json in production), so the
+    # held-out lock isn't lost -- the next sync_split_files() call restores it.
+    manifest_path = tmp_path / "splits.json"
+    manifest_path.write_text(json.dumps({"version": 1, "text": {
+        "held_out": {"path": "x", "sha256": "lockedhash", "locked_at": "2026-10-01T00:00:00"}}, "tasks": {}}))
+
+    db_path = tmp_path / "runs.duckdb"
+    con = db.connect(str(db_path))
+    db.sync_split_files(con, manifest_path)
+    assert con.execute("SELECT sha256 FROM split_files WHERE name='held_out'").fetchone()[0] == "lockedhash"
+    con.close()
+
+    db.rebuild(str(db_path), str(tmp_path / "runs"))  # deletes and recreates db_path
+    # connect() always auto-syncs from the real project data/splits.json when no
+    # manifest_path is given (that's the whole point -- a fresh connect() in
+    # production restores the real lock), so this test re-syncs its own tmp
+    # manifest explicitly rather than asserting on connect()'s implicit default,
+    # which would otherwise pick up whatever this repo's actual data/splits.json
+    # happens to contain.
+    con = db.connect(str(db_path))
+    db.sync_split_files(con, manifest_path)
+    assert con.execute("SELECT sha256 FROM split_files WHERE name='held_out'").fetchone()[0] == "lockedhash"
     con.close()
 
 
