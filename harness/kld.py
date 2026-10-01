@@ -1,6 +1,8 @@
 """Week 1: KL divergence of quantized models against a reference (e.g. Q8_0).
 
 Step 1 saves the reference logits once; step 2 compares each candidate to them.
+The actual subprocess/log handling lives in harness/llama.py, shared with the
+Week 2 orchestrator (run.py) so both paths behave identically.
 
 Example:
   python -m harness.kld --ref models/qwen-4b-Q8_0.gguf --text data/dev.txt \\
@@ -12,10 +14,11 @@ import argparse
 import json
 import os
 import re
-import subprocess
 from pathlib import Path
 
-DEFAULT_BIN = "third_party/llama.cpp/build/bin"
+from harness import llama
+
+DEFAULT_BIN = llama.DEFAULT_BIN
 
 # Lines llama-perplexity prints in its KL summary, e.g. "Mean    KLD:   0.012345 ±   0.000123"
 PATTERNS = {
@@ -35,15 +38,6 @@ def parse(log: str) -> dict:
     return out
 
 
-def run(cmd: list[str], log_path: Path) -> str:
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    log = p.stdout + p.stderr
-    log_path.write_text(log)
-    if p.returncode != 0:
-        raise RuntimeError(f"{cmd[0]} failed, see {log_path}")
-    return log
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ref", required=True, help="reference model, e.g. Q8_0 (say so in writeups)")
@@ -54,23 +48,21 @@ def main() -> None:
     ap.add_argument("candidates", nargs="+")
     args = ap.parse_args()
 
-    ppl = str(Path(args.bin_dir) / "llama-perplexity")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     base = out / f"{Path(args.ref).stem}_{Path(args.text).stem}_c{args.ctx}.kld"
 
-    common = ["-f", args.text, "-c", str(args.ctx), "-ngl", "99"]
     if not base.exists():
         print(f"saving reference logits -> {base}")
-        run([ppl, "-m", args.ref, *common, "--kl-divergence-base", str(base)],
-            out / f"{base.stem}.ref.log")
+    llama.reference_logits(Path(args.ref), Path(args.text), args.ctx, base, bin_dir=args.bin_dir)
 
     results = []
     for cand in args.candidates:
-        log = run([ppl, "-m", cand, *common, "--kl-divergence-base", str(base), "--kl-divergence"],
-                  out / f"{Path(cand).stem}_c{args.ctx}.log")
+        log_path = out / f"{Path(cand).stem}_c{args.ctx}.log"
         r = {"model": cand, "ref": args.ref, "ctx": args.ctx, "text": args.text,
-             "size_bytes": Path(cand).stat().st_size, **parse(log)}
+             "size_bytes": Path(cand).stat().st_size,
+             **llama.kl_divergence(Path(cand), base, Path(args.text), args.ctx, [], log_path,
+                                    bin_dir=args.bin_dir)}
         results.append(r)
         print(json.dumps(r))
 
