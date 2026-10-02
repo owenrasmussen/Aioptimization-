@@ -2,6 +2,14 @@
 
 Oct 1, 2026
 
+> **Correction (Week 4):** the "first real comparison" section below (f16
+> vs. q8_0 KV cache) was confounded by `flash_attn` differing between the
+> two specs, not just KV type. With that controlled for, q8_0 KV cache is
+> actually *slower* on speed; the quality findings (no detectable
+> difference) still stand. See
+> [docs/week4-results.md](week4-results.md)'s "Corrections to prior weeks"
+> for the corrected, single-variable, properly-interleaved comparison.
+
 Added the other two quality layers from [docs/plan.md](plan.md) section 1
 (KL divergence shipped in Week 1/2): a fixed task suite (GSM8K + HumanEval)
 via `lm-evaluation-harness` against `llama-server`, and a long-context suite

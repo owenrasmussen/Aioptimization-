@@ -63,6 +63,49 @@ def test_load_eval_text_detects_paragraph_leak(tmp_path):
     assert split == "adhoc"
 
 
+def test_load_eval_text_detects_shingle_leak_with_edited_word(tmp_path):
+    # Week 4 red-team case: paragraph-hash matching alone misses a leak where
+    # one word has been changed -- the 13-gram shingle check catches the
+    # unmodified run of words around the edit.
+    manifest_path = tmp_path / "splits.json"
+    sentence = ("the quick brown fox jumps over the lazy dog while a dozen "
+                "curious onlookers watch from the nearby fence line today")
+    held = _write(tmp_path / "held_out.txt", f"{sentence}.\n")
+    splits.lock_held_out(held, manifest_path=manifest_path)
+
+    edited = sentence.replace("fox", "wolf")  # one word changed, rest identical
+    leaked = _write(tmp_path / "dev.txt", f"some other text.\n\n{edited}.\n")
+    manifest = splits.load_manifest(manifest_path)
+
+    # paragraph hashes alone would NOT catch this (the paragraph text differs)
+    assert set(splits.paragraph_hashes(leaked.read_text())) & set(
+        manifest["text"]["held_out"]["paragraph_sha256"]) == set()
+    # but the shingle check does
+    with pytest.raises(splits.HeldOutViolation):
+        splits.load_eval_text(leaked, manifest, allow_held_out=False)
+
+
+def test_load_eval_text_detects_shingle_leak_merged_paragraphs(tmp_path):
+    manifest_path = tmp_path / "splits.json"
+    held_text = ("project zephyrion was led by a small team of researchers who worked "
+                  "for several years on the underlying problem before publishing\n\n"
+                  "their findings were later cited by many other groups across the field")
+    held = _write(tmp_path / "held_out.txt", held_text)
+    splits.lock_held_out(held, manifest_path=manifest_path)
+
+    # the two held-out paragraphs merged into one, no blank line -- a
+    # different paragraph hash than either original, but the same 13-grams
+    merged = held_text.replace("\n\n", " ")
+    leaked = _write(tmp_path / "search.txt", f"unrelated intro text here.\n\n{merged}\n")
+    manifest = splits.load_manifest(manifest_path)
+    with pytest.raises(splits.HeldOutViolation):
+        splits.load_eval_text(leaked, manifest, allow_held_out=False)
+
+
+def test_shingles_short_text_returns_empty_set():
+    assert splits.shingles("too short") == set()
+
+
 def test_load_eval_text_clean_dev_passes(tmp_path):
     manifest_path = tmp_path / "splits.json"
     held = _write(tmp_path / "held_out.txt", "held out only sentence.\n")

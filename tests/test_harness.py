@@ -49,6 +49,25 @@ def test_unknown_kv_type_rejected():
         CandidateSpec(base_model="m.gguf", quant="Q4_K_M", kv_type_k="not_a_type")
 
 
+def test_engine_flags_allowlist_rejects_kv_smuggling():
+    # Week 4 red-team finding: engine_flags could claim one KV config while
+    # a spec field claims another, and different tools would see different
+    # flags. -ctk/-ctv/-fa must go through the real fields, never engine_flags.
+    with pytest.raises(ValueError):
+        CandidateSpec(base_model="m.gguf", quant="Q4_K_M", flash_attn=False,
+                       engine_flags=("-ctk", "q4_0", "-ctv", "q4_0", "-fa", "on"))
+
+
+def test_engine_flags_allowlist_rejects_depth_smuggling():
+    with pytest.raises(ValueError):
+        CandidateSpec(base_model="m.gguf", quant="Q4_K_M", ctx=8192, engine_flags=("-d", "0"))
+
+
+def test_engine_flags_allowlist_accepts_threads():
+    spec = CandidateSpec(base_model="m.gguf", quant="Q4_K_M", engine_flags=("-t", "8"))
+    assert spec.engine_flags == ("-t", "8")
+
+
 def test_from_json_rejects_unknown_fields(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text('{"base_model": "m.gguf", "quant": "Q4_K_M", "contex": 8192}')

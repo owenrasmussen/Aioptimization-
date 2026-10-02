@@ -142,6 +142,29 @@ CREATE TABLE IF NOT EXISTS split_files (
   sha256     VARCHAR NOT NULL,
   locked_at  TIMESTAMP
 );
+
+-- Week 4: new tables for new data, rather than new columns on existing ones
+-- (CREATE TABLE IF NOT EXISTS can't alter an existing table's columns, and
+-- insert_record's positional VALUES breaks the moment a column count
+-- changes without a --rebuild -- hit this twice already fixing it that way
+-- in Weeks 2-3; new tables avoid needing it for this week's additions).
+CREATE TABLE IF NOT EXISTS schedule (
+  run_id     VARCHAR PRIMARY KEY,
+  session_id VARCHAR NOT NULL,
+  arm        INTEGER NOT NULL,
+  round      INTEGER NOT NULL,
+  order_pos  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS checks (
+  run_id   VARCHAR NOT NULL,
+  name     VARCHAR NOT NULL,
+  passed   BOOLEAN NOT NULL,
+  value    DOUBLE,
+  bound    DOUBLE,
+  details  JSON,
+  PRIMARY KEY (run_id, name)
+);
 """
 
 
@@ -239,6 +262,18 @@ def insert_record(con: duckdb.DuckDBPyConnection, record: dict) -> None:
             con.execute(
                 "INSERT OR REPLACE INTO failures VALUES (?,?,?,?)",
                 [r["run_id"], f["type"], f.get("message"), f.get("log_path")],
+            )
+        if r.get("schedule"):
+            sc = r["schedule"]
+            con.execute(
+                "INSERT OR REPLACE INTO schedule VALUES (?,?,?,?,?)",
+                [r["run_id"], sc["session_id"], sc["arm"], sc["round"], sc["order_pos"]],
+            )
+        for c in r.get("checks") or []:
+            con.execute(
+                "INSERT OR REPLACE INTO checks VALUES (?,?,?,?,?,?)",
+                [r["run_id"], c["name"], c["passed"], c.get("value"), c.get("bound"),
+                 json.dumps(c.get("details")) if c.get("details") else None],
             )
 
 

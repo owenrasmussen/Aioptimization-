@@ -1,24 +1,31 @@
-"""The orchestrator: a candidate spec goes in, a result record comes out.
+"""The orchestrator: candidate specs go in, interleaved measurements and a
+result record come out.
 
-python -m harness.run specs/example.json --repeats 5 --pp 512 --tg 128 \\
+python -m harness.run specs/a.json specs/b.json --repeats 10 --pp 512 --tg 128 \\
     --max-temp 45 --kld-ref models/qwen2.5-3b-instruct-Q8_0.gguf --kld-text data/dev.txt \\
     --lm-eval-tasks gsm8k,humaneval --run-longctx
 
-For each spec: build (or reuse, from the artifact cache keyed by artifact_hash)
-the quantized model, measure pp and tg speed as separate llama-bench
-invocations (so each phase's sampled energy belongs to that phase, not a
-load+pp+tg blend), measure KL divergence against a fixed reference model with
-the spec's own KV-cache flags applied, optionally run a task suite
-(GSM8K/HumanEval, via harness.lmeval) and the long-context suite
-(needle/multi-hop, via harness.longctx) against a real llama-server, and write
-both a raw JSON result record (results/runs/<id>/record.json, the source of
-truth) and rows into the DuckDB store (results/runs.duckdb, a rebuildable
-summary of those records).
+Passing N specs interleaves their bench repeats (round-robin, rotating order
+each round) rather than measuring spec A fully, then spec B fully -- the
+latter is a real methodological mistake (docs/plan.md section 4: interleave
+so thermal drift affects every arm equally), and Week 2/3 made it. There is
+deliberately only one execution path here, so it can't be made again by
+accident; `harness/compare.py` reads the results back out of the DB rather
+than offering a second way to run things.
 
-Every quality measure that reads free text (KL, the long-context haystack) or
-task docs (lm-eval) goes through harness.splits' chokepoints first, which
-classify the input by content hash against data/splits.json and refuse the
-held-out split without --allow-held-out.
+For each spec ("arm"): build (or reuse, from the artifact cache keyed by
+artifact_hash, verified by actual GGUF quant type -- not just a file existing
+at the expected path) the quantized model, measure pp/tg speed interleaved
+across all arms (each bench record checked against what was actually asked
+for, and against a physics "speed of light" bound), then per arm: KL
+divergence, optionally a task suite (GSM8K/HumanEval) and the long-context
+suite, against a real llama-server. Every quality measure that reads free
+text or task docs goes through harness.splits' chokepoints first. Writes a
+raw JSON result record (results/runs/<id>/record.json, the source of truth)
+twice -- once after the bench phase, again after quality -- so a crash
+during one arm's quality suite in a larger sweep doesn't lose the bench data
+already collected for every arm; and rows into DuckDB (results/runs.duckdb,
+a rebuildable summary of those records).
 """
 from __future__ import annotations
 
@@ -27,21 +34,40 @@ import datetime as dt
 import hashlib
 import json
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from harness import db, gpu, llama, lmeval, longctx, memory, splits
+from harness import db, gpu, llama, lmeval, longctx, memory, physics, splits
 from harness.server import LlamaServer, ServerFailed
 from harness.spec import CandidateSpec
+
+_QUANT_FILE_TYPE = {  # general.file_type values, checked against llama.cpp's llama_ftype enum
+    "F32": 0, "F16": 1, "Q4_0": 2, "Q4_1": 3, "Q8_0": 7, "Q5_0": 8, "Q5_1": 9,
+    "Q2_K": 10, "Q3_K_S": 11, "Q3_K_M": 12, "Q3_K_L": 13, "Q4_K_S": 14, "Q4_K_M": 15,
+    "Q5_K_S": 16, "Q5_K_M": 17, "Q6_K": 18, "BF16": 32,
+}
 
 
 def _hash_dict(d: dict) -> str:
     return hashlib.sha256(json.dumps(d, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
 
+def _actual_file_type(gguf_path: Path) -> int | None:
+    from gguf import GGUFReader
+
+    r = GGUFReader(gguf_path)
+    f = r.fields.get("general.file_type")
+    return None if f is None else int(f.parts[f.data[0]][0])
+
+
 def ensure_artifact(spec: CandidateSpec, cache_dir: Path, log_dir: Path, bin_dir: str) -> dict:
     """Build (or reuse) the weights file for spec.artifact_hash. This *is* the
-    artifact cache: a file at the expected path means it's already built."""
+    artifact cache: a file at the expected path means it's already built --
+    but a cache hit also checks the file's actual GGUF quant type against
+    spec.quant (Week 4 red-team finding: nothing previously stopped a wrong
+    file, e.g. a Q3_K_M copied over a Q4_K_M cache path, from being silently
+    measured and reported under the wrong label)."""
     if spec.quant in ("F16", "BF16"):
         path = Path(spec.base_model)
         return {"path": str(path), "size_bytes": path.stat().st_size,
@@ -50,6 +76,11 @@ def ensure_artifact(spec: CandidateSpec, cache_dir: Path, log_dir: Path, bin_dir
     cache_dir.mkdir(parents=True, exist_ok=True)
     dst = cache_dir / f"{spec.artifact_hash}.gguf"
     if dst.exists():
+        expected = _QUANT_FILE_TYPE.get(spec.quant)
+        actual = _actual_file_type(dst)
+        if expected is not None and actual is not None and actual != expected:
+            raise ValueError(f"cached artifact {dst} has file_type={actual}, expected {expected} "
+                              f"for quant={spec.quant!r} -- the cache is poisoned or stale, delete it")
         return {"path": str(dst), "size_bytes": dst.stat().st_size,
                 "build_seconds": None, "build_cmd": None, "built_at": None}
 
@@ -86,29 +117,96 @@ def _new_run_entry(workload_id: str, workload: dict, repeat: int, run_dir: Path,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "wall_seconds": None, "status": "ok", "command": None, "log_path": str(log_path),
         "speed": None, "resources": None, "quality": None, "failure": None,
+        "schedule": None, "checks": [],
     }
     return entry, log_path
 
 
+def _check_bench_record(recs: list[dict], spec: CandidateSpec, artifact_path: Path, pp: int, tg: int,
+                         depth: int) -> list[str]:
+    """Returns a list of problems (empty = clean). llama-bench can return
+    more than one record, or one that doesn't match what was actually
+    asked for, if flags smuggle extra -p/-n/-d values or the KV/batch
+    settings drifted -- this is the check that the measurement actually
+    measured the spec, not just that llama-bench exited 0."""
+    problems = []
+    if len(recs) != 1:
+        return [f"expected 1 bench record, got {len(recs)}"]
+    r = recs[0]
+    if r.get("n_prompt") != pp:
+        problems.append(f"n_prompt={r.get('n_prompt')} != requested {pp}")
+    if r.get("n_gen") != tg:
+        problems.append(f"n_gen={r.get('n_gen')} != requested {tg}")
+    if r.get("n_depth") != depth:
+        problems.append(f"n_depth={r.get('n_depth')} != requested {depth}")
+    if r.get("type_k") != spec.kv_type_k:
+        problems.append(f"type_k={r.get('type_k')!r} != spec {spec.kv_type_k!r}")
+    if r.get("type_v") != spec.kv_type_v:
+        problems.append(f"type_v={r.get('type_v')!r} != spec {spec.kv_type_v!r}")
+    want_fa = 1 if spec.flash_attn else 0
+    if r.get("flash_attn") not in (want_fa, bool(want_fa)):
+        problems.append(f"flash_attn={r.get('flash_attn')!r} != spec {want_fa}")
+    if r.get("n_gpu_layers") != 99:
+        problems.append(f"n_gpu_layers={r.get('n_gpu_layers')} != 99")
+    if spec.batch_size and r.get("n_batch") != spec.batch_size:
+        problems.append(f"n_batch={r.get('n_batch')} != spec {spec.batch_size}")
+    if spec.ubatch_size and r.get("n_ubatch") != spec.ubatch_size:
+        problems.append(f"n_ubatch={r.get('n_ubatch')} != spec {spec.ubatch_size}")
+    got_model = Path(r.get("model_filename", "")).resolve()
+    if got_model != artifact_path.resolve():
+        problems.append(f"model_filename={got_model} != artifact {artifact_path.resolve()}")
+    return problems
+
+
 def measure_bench(spec: CandidateSpec, artifact_path: Path, kind: str, pp: int, tg: int, repeat: int,
                    extra_flags: list[str], run_dir: Path, max_temp: int, bin_dir: str,
-                   overhead_gb: float) -> dict:
-    workload = {"kind": kind, "input_len": pp, "output_len": tg, "concurrency": 1}
+                   overhead_gb: float, bandwidth: dict, schedule: dict | None = None) -> dict:
+    depth = spec.ctx
+    workload = {"kind": kind, "input_len": pp, "output_len": tg, "depth": depth, "concurrency": 1}
     workload_id = _hash_dict(workload)
     entry, log_path = _new_run_entry(workload_id, workload, repeat, run_dir, f"{kind}_{repeat}", max_temp)
+    entry["schedule"] = schedule
     t0 = time.monotonic()
     try:
         with gpu.Sampler() as sampler:
-            recs = llama.bench(artifact_path, pp, tg, 1, extra_flags, log_path, depth=spec.ctx,
+            recs = llama.bench(artifact_path, pp, tg, 1, extra_flags, log_path, depth=depth,
                                 bin_dir=bin_dir)
         entry["wall_seconds"] = time.monotonic() - t0
+
+        problems = _check_bench_record(recs, spec, artifact_path, pp, tg, depth)
+        if problems:
+            entry["status"] = "invalid"
+            entry["failure"] = {"type": "bench_mismatch", "message": "; ".join(problems),
+                                 "log_path": str(log_path)}
+            return entry
+
         r = recs[0]
-        entry["speed"] = {"pp_tps": r["avg_ts"] if pp else None, "tg_tps": r["avg_ts"] if tg else None,
+        tps = r["avg_ts"]
+        entry["speed"] = {"pp_tps": tps if pp else None, "tg_tps": tps if tg else None,
                            "ttft_ms": None, "p50_ms": None, "p95_ms": None, "raw": r}
         res = sampler.summary(n_tokens=tg or None)
         res["predicted_total_mb"] = _predicted_total_mb(spec, artifact_path, overhead_gb)
         res["nvml_log"] = None
         entry["resources"] = res
+
+        # The physics "speed of light" check: a result that exceeds the
+        # hardware's theoretical ceiling is a bug or a cheat, not good noise.
+        if tg and bandwidth.get("gbps"):
+            bpt = physics.decode_bytes_per_token(artifact_path, depth, spec.kv_type_k, spec.kv_type_v)
+            if bpt:
+                check = physics.check_decode(tps, bpt["total"], bandwidth["gbps"])
+                entry["checks"].append(check)
+                if not check["passed"]:
+                    entry["status"] = "invalid"
+                    entry["failure"] = {"type": "physics", "message": f"tg_tps {tps} exceeds "
+                                         f"bandwidth bound {check['bound']:.1f}", "log_path": str(log_path)}
+        if pp and bandwidth.get("peak_tops") and r.get("model_n_params"):
+            check = physics.check_prefill(tps, r["model_n_params"], bandwidth["peak_tops"])
+            entry["checks"].append(check)
+            if not check["passed"]:
+                entry["status"] = "invalid"
+                entry["failure"] = {"type": "physics", "message": f"pp_tps {tps} exceeds "
+                                     f"compute bound {check['bound']:.1f}", "log_path": str(log_path)}
     except llama.RunFailed as e:
         entry["status"] = "failed"
         entry["failure"] = {"type": "bench", "message": str(e), "log_path": str(e.log_path)}
@@ -123,10 +221,6 @@ def measure_kld(spec: CandidateSpec, artifact_path: Path, ref: Path, text: Path,
     workload_id = _hash_dict(workload)
     entry, log_path = _new_run_entry(workload_id, workload, 0, run_dir, "kld", max_temp)
     t0 = time.monotonic()
-    # Keyed on ref+text+ctx+chunks: a reference-logits file is only valid for the
-    # exact (model, text, ctx, chunks) it was built from. Missing the text/chunks
-    # from this key was a real bug -- pointing --kld-text at a different file with
-    # the same --kld-ref would have silently reused the wrong reference logits.
     ref_base = cache_dir / f"ref_{ref.stem}_{text_hash}_c{ctx}_n{chunks or 0}.kld"
     try:
         llama.reference_logits(ref, text, ctx, ref_base, chunks=chunks, bin_dir=bin_dir)
@@ -146,10 +240,7 @@ def measure_kld(spec: CandidateSpec, artifact_path: Path, ref: Path, text: Path,
 
 def _load_eval_text(path: Path, allow_held_out: bool) -> tuple[str, str, str]:
     """Wraps splits.load_eval_text, falling back to treating the file as
-    unclassified ("adhoc") if data/splits.json doesn't exist yet (e.g. a
-    fresh clone before scripts/fetch_wiki.py has run) -- there's nothing to
-    protect against yet in that case, so this degrades safely rather than
-    hard-failing Week 1/2-style usage."""
+    unclassified ("adhoc") if data/splits.json doesn't exist yet."""
     try:
         manifest = splits.load_manifest()
     except FileNotFoundError:
@@ -161,9 +252,6 @@ def _load_eval_text(path: Path, allow_held_out: bool) -> tuple[str, str, str]:
 def measure_lm_eval(spec: CandidateSpec, artifact_path: Path, tasks: list[str], eval_split: str,
                      allow_held_out: bool, limit: int | None, run_dir: Path, max_temp: int,
                      bin_dir: str) -> list[dict]:
-    """One short-context server (GSM8K/HumanEval need only a few thousand
-    tokens of context, nowhere near the long-context suite's needs), one
-    quality run entry per task."""
     server_ctx = 4096
     try:
         manifest = splits.load_manifest()
@@ -221,7 +309,7 @@ def measure_longctx(spec: CandidateSpec, artifact_path: Path, lengths: list[int]
                      text_split: str, seeds: tuple[int, ...], run_dir: Path, max_temp: int,
                      bin_dir: str) -> list[dict]:
     paras = longctx.paragraphs_from_text(haystack_text)
-    server_ctx = max(lengths) + 512  # headroom for the question and the generation
+    server_ctx = max(lengths) + 512
 
     try:
         with LlamaServer(artifact_path, spec, server_ctx, run_dir / "longctx_server.log",
@@ -243,10 +331,6 @@ def measure_longctx(spec: CandidateSpec, artifact_path: Path, lengths: list[int]
                 entries.append(entry)
         return entries
 
-    # Recorded after the suite runs, not before each trial -- unlike bench/KL,
-    # this is a quality-only measurement and isn't thermal-sensitive, so one
-    # wait_for_cool before the server starts (not threaded through every trial)
-    # is an acceptable simplification.
     entries = []
     for eval_name, s in summary.items():
         length = int(eval_name.rsplit("_", 1)[1])
@@ -265,31 +349,76 @@ def measure_longctx(spec: CandidateSpec, artifact_path: Path, lengths: list[int]
     return entries
 
 
-def run_spec(spec_path: Path, args: argparse.Namespace) -> dict:
+@dataclass
+class Arm:
+    idx: int
+    spec: CandidateSpec
+    spec_path: Path
+    run_dir: Path
+    artifact: dict
+    artifact_path: Path
+    extra_flags: list[str]
+    bench_runs: list[dict] = field(default_factory=list)
+    quality_runs: list[dict] = field(default_factory=list)
+
+
+def prepare_arm(idx: int, spec_path: Path, session_id: str, args: argparse.Namespace) -> Arm:
+    """Loads the spec and builds/verifies its artifact -- done for every arm
+    before any GPU time is spent on benchmarking, so a quantize failure on
+    arm 5 of 6 is caught before arms 0-4 waste a bench run that'll be
+    reported alongside a half-prepared sweep."""
     spec = CandidateSpec.from_json(spec_path)
-    spec_hash, artifact_hash = spec.spec_hash, spec.artifact_hash
-
-    run_dir = Path(args.out) / f"{spec_hash}_{dt.datetime.now():%Y%m%d_%H%M%S}"
+    run_dir = Path(args.out) / f"{spec.spec_hash}_{session_id}_a{idx}"
     run_dir.mkdir(parents=True, exist_ok=True)
-
     artifact = ensure_artifact(spec, Path(args.cache_dir), run_dir, args.bin_dir)
-    artifact_path = Path(artifact["path"])
-
-    env = gpu.environment()
-    commit = gpu.llamacpp_commit(str(Path(args.bin_dir).resolve().parents[1]))
-    stable = gpu.stable_env(env, commit)
-    env_id = _hash_dict(stable)
-
     extra_flags = llama.spec_flags(spec) + list(spec.engine_flags)
+    return Arm(idx, spec, spec_path, run_dir, artifact, Path(artifact["path"]), extra_flags)
 
-    runs = []
-    for kind, pp, tg in (("bench_pp", args.pp, 0), ("bench_tg", 0, args.tg)):
-        for rep in range(args.repeats):
-            runs.append(measure_bench(spec, artifact_path, kind, pp, tg, rep, extra_flags, run_dir,
-                                       args.max_temp, args.bin_dir, args.overhead_gb))
 
-    # llama-bench's own JSON already reports model size/param count -- no need
-    # to parse the GGUF separately for bits-per-weight.
+def bench_interleaved(arms: list[Arm], session_id: str, args: argparse.Namespace) -> None:
+    """Rotates arm order each round (a Latin square, not fixed A,B,A,B --
+    removes position bias too) and runs kind-major within a round (all
+    arms' pp, then all arms' tg), so paired measurements across arms land
+    as close together in time as possible: this is what interleaving is
+    for -- sharing thermal drift and any other slow confound across every
+    arm equally, per docs/plan.md section 4."""
+    n = len(arms)
+    bandwidth = physics.peak_bandwidth_gbps(override=args.bandwidth_gbps)
+    bandwidth["peak_tops"] = args.peak_tops or physics.KNOWN_PEAK_DENSE_TOPS.get(
+        gpu.environment()["gpu"])
+
+    for rnd in range(args.repeats):
+        order = arms[rnd % n:] + arms[:rnd % n]
+        for kind, pp, tg in (("bench_pp", args.pp, 0), ("bench_tg", 0, args.tg)):
+            for pos, arm in enumerate(order):
+                schedule = {"session_id": session_id, "arm": arm.idx, "round": rnd, "order_pos": pos}
+                entry = measure_bench(arm.spec, arm.artifact_path, kind, pp, tg, rnd, arm.extra_flags,
+                                       arm.run_dir, args.max_temp, args.bin_dir, args.overhead_gb,
+                                       bandwidth, schedule=schedule)
+                arm.bench_runs.append(entry)
+
+
+def run_quality(arm: Arm, args: argparse.Namespace) -> None:
+    if not args.no_kld:
+        kld_path = Path(args.kld_text)
+        _, kld_split, kld_text_hash = _load_eval_text(kld_path, args.allow_held_out)
+        arm.quality_runs.append(measure_kld(arm.spec, arm.artifact_path, Path(args.kld_ref), kld_path,
+                                             kld_text_hash, kld_split, args.kld_ctx, args.kld_chunks,
+                                             Path(args.cache_dir), arm.run_dir, args.max_temp, args.bin_dir))
+    if args.lm_eval_tasks:
+        arm.quality_runs += measure_lm_eval(arm.spec, arm.artifact_path, args.lm_eval_tasks,
+                                             args.eval_split, args.allow_held_out, args.lm_eval_limit,
+                                             arm.run_dir, args.max_temp, args.bin_dir)
+    if args.run_longctx:
+        haystack_path = Path(args.longctx_text or args.kld_text)
+        haystack_text, longctx_split, _ = _load_eval_text(haystack_path, args.allow_held_out)
+        arm.quality_runs += measure_longctx(arm.spec, arm.artifact_path, args.longctx_lengths,
+                                             haystack_text, longctx_split, tuple(range(args.longctx_seeds)),
+                                             arm.run_dir, args.max_temp, args.bin_dir)
+
+
+def write_record(arm: Arm, env: dict, env_id: str, args: argparse.Namespace) -> dict:
+    runs = arm.bench_runs + arm.quality_runs
     n_params = bpw = None
     for r in runs:
         raw = (r.get("speed") or {}).get("raw")
@@ -298,52 +427,30 @@ def run_spec(spec_path: Path, args: argparse.Namespace) -> dict:
             bpw = raw["model_size"] * 8 / raw["model_n_params"]
             break
 
-    if not args.no_kld:
-        kld_path = Path(args.kld_text)
-        # The chokepoint: classifies kld_path by its actual content hash (never
-        # by the --kld-text string itself) and raises if it's the held-out
-        # split, or leaks held-out paragraphs, without --allow-held-out.
-        _, kld_split, kld_text_hash = _load_eval_text(kld_path, args.allow_held_out)
-        runs.append(measure_kld(spec, artifact_path, Path(args.kld_ref), kld_path, kld_text_hash,
-                                 kld_split, args.kld_ctx, args.kld_chunks, Path(args.cache_dir), run_dir,
-                                 args.max_temp, args.bin_dir))
-
-    if args.lm_eval_tasks:
-        runs += measure_lm_eval(spec, artifact_path, args.lm_eval_tasks, args.eval_split,
-                                 args.allow_held_out, args.lm_eval_limit, run_dir, args.max_temp,
-                                 args.bin_dir)
-
-    if args.run_longctx:
-        haystack_path = Path(args.longctx_text or args.kld_text)
-        haystack_text, longctx_split, _ = _load_eval_text(haystack_path, args.allow_held_out)
-        runs += measure_longctx(spec, artifact_path, args.longctx_lengths, haystack_text, longctx_split,
-                                 tuple(range(args.longctx_seeds)), run_dir, args.max_temp, args.bin_dir)
-
     record = {
-        "record_version": 2, "spec_hash": spec_hash, "artifact_hash": artifact_hash, "env_id": env_id,
-        "spec": spec.to_dict(),
-        "artifact": {**artifact, "n_params": n_params, "bpw": bpw},
-        "environment": stable,
-        "runs": runs,
+        "record_version": 3, "spec_hash": arm.spec.spec_hash, "artifact_hash": arm.spec.artifact_hash,
+        "env_id": env_id, "spec": arm.spec.to_dict(),
+        "artifact": {**arm.artifact, "n_params": n_params, "bpw": bpw},
+        "environment": env, "runs": runs,
     }
-    (run_dir / "record.json").write_text(json.dumps(record, indent=2, default=str))
-
+    (arm.run_dir / "record.json").write_text(json.dumps(record, indent=2, default=str))
     con = db.connect(args.db)
     db.insert_record(con, record)
     con.close()
-    print(f"spec {spec_hash} ({spec.quant}, kv={spec.kv_type_k}/{spec.kv_type_v}, ctx={spec.ctx}): "
-          f"{sum(1 for r in runs if r['status'] == 'ok')}/{len(runs)} runs ok -> {run_dir}")
     return record
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("specs", nargs="+", help="one or more candidate spec JSON files")
-    ap.add_argument("--repeats", type=int, default=5)
+    ap.add_argument("specs", nargs="+", help="one or more candidate spec JSON files (interleaved if >1)")
+    ap.add_argument("--repeats", type=int, default=10,
+                     help="min 5 -- fewer rounds can't reach significance in the bootstrap/sign test")
     ap.add_argument("--pp", type=int, default=512)
     ap.add_argument("--tg", type=int, default=128)
     ap.add_argument("--max-temp", type=int, default=70)
     ap.add_argument("--overhead-gb", type=float, default=0.8, help="see docs/week1-results.md for calibration")
+    ap.add_argument("--bandwidth-gbps", type=float, default=None, help="override the physics bandwidth bound")
+    ap.add_argument("--peak-tops", type=float, default=None, help="override the physics compute bound")
     ap.add_argument("--bin-dir", default=llama.DEFAULT_BIN)
     ap.add_argument("--cache-dir", default="models/cache")
     ap.add_argument("--out", default="results/runs")
@@ -374,9 +481,30 @@ def main() -> None:
         ap.error("--run-longctx needs --longctx-text or --kld-text to source the haystack")
     if args.eval_split == "held_out" and not args.allow_held_out:
         ap.error("--eval-split held_out requires --allow-held-out")
+    if args.repeats < 5:
+        ap.error("--repeats must be at least 5 (docs/plan.md section 4: 'run at least 5 repeats')")
 
-    for spec_path in args.specs:
-        run_spec(Path(spec_path), args)
+    session_id = uuid4().hex[:8]
+    env = gpu.environment()
+    commit = gpu.llamacpp_commit(str(Path(args.bin_dir).resolve().parents[1]))
+    stable = gpu.stable_env(env, commit)
+    env_id = _hash_dict(stable)
+
+    arms = [prepare_arm(i, Path(p), session_id, args) for i, p in enumerate(args.specs)]
+    bench_interleaved(arms, session_id, args)
+    for arm in arms:
+        write_record(arm, stable, env_id, args)  # bench-only checkpoint
+    for arm in arms:
+        run_quality(arm, args)
+        write_record(arm, stable, env_id, args)  # full record
+        ok = sum(1 for r in arm.bench_runs + arm.quality_runs if r["status"] == "ok")
+        total = len(arm.bench_runs) + len(arm.quality_runs)
+        print(f"arm {arm.idx} {arm.spec.spec_hash} ({arm.spec.quant}, kv={arm.spec.kv_type_k}/"
+              f"{arm.spec.kv_type_v}, fa={arm.spec.flash_attn}, ctx={arm.spec.ctx}): "
+              f"{ok}/{total} runs ok -> {arm.run_dir}")
+
+    if len(arms) > 1:
+        print(f"session {session_id}: python -m harness.compare --session {session_id}")
 
 
 if __name__ == "__main__":

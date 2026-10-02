@@ -21,6 +21,16 @@ KV_TYPES = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_
 # KV types that don't need flash attention to work (full/half precision, stored non-transposed).
 KV_TYPES_NO_FA_REQUIRED = {"f32", "f16", "bf16"}
 
+# Flags proven not to change measured numerics (CPU thread count only -- never
+# touches KV cache type, batch/ubatch size, depth, or GPU layer count). Found
+# live during Week 4 red-teaming: engine_flags like `-ctk q4_0 -ctv q4_0 -fa on`
+# would silently measure speed at one KV config and quality at another under
+# one honest-looking spec_hash, since run.py only appended engine_flags to the
+# bench call, not to KL/the server. Anything that could do that has to become
+# a real CandidateSpec field (kv_type_k/v, flash_attn, batch_size, ...), which
+# every tool call already builds from consistently via llama.spec_flags().
+_ENGINE_FLAGS_ALLOWLIST = {"-t", "--threads"}
+
 _DEFAULTS = {
     "kv_type_k": "f16",
     "kv_type_v": "f16",
@@ -63,6 +73,18 @@ class CandidateSpec:
             raise ValueError(
                 f"kv_type_v={self.kv_type_v!r} needs flash_attn=true in llama.cpp"
             )
+        i = 0
+        while i < len(self.engine_flags):
+            flag = self.engine_flags[i]
+            if flag not in _ENGINE_FLAGS_ALLOWLIST:
+                raise ValueError(
+                    f"engine_flags entry {flag!r} is not on the allowlist "
+                    f"{sorted(_ENGINE_FLAGS_ALLOWLIST)} -- flags that could change KV cache, "
+                    f"batch/ubatch size, depth, or GPU layers must be real CandidateSpec fields, "
+                    f"not engine_flags, so speed/quality/the server can't silently disagree about "
+                    f"the config under one spec_hash"
+                )
+            i += 2  # every allowlisted flag currently takes exactly one value
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -1,6 +1,6 @@
 from harness.memory import ModelShape, kv_cache_bytes
 from harness.kld import parse
-from harness.stats import bootstrap_diff_ci, summarize
+from harness.stats import bootstrap_diff_ci, bootstrap_prop_diff_ci, paired_rel_diff_ci, summarize
 
 
 def test_kv_cache_llama3_8b_f16():
@@ -24,6 +24,36 @@ def test_summarize_and_diff_ci():
     assert lo > 0  # clearly different
     lo, hi = bootstrap_diff_ci(a, a)
     assert lo <= 0 <= hi
+
+
+def test_paired_rel_diff_ci_identical_series_contains_zero():
+    a = [100.0, 101.0, 99.5, 100.5, 100.2, 99.8]
+    lo, hi = paired_rel_diff_ci(a, a)
+    assert lo <= 0 <= hi
+
+
+def test_paired_rel_diff_ci_detects_real_relative_shift():
+    a = [100.0, 101.0, 99.5, 100.5, 100.2, 99.8]
+    b = [x * 1.10 for x in a]  # exactly 10% faster every round, paired
+    lo, hi = paired_rel_diff_ci(a, b)
+    assert lo > 0.05  # clearly excludes 0, centered near +0.10
+
+
+def test_paired_rel_diff_ci_requires_equal_length():
+    import pytest
+    with pytest.raises(ValueError):
+        paired_rel_diff_ci([1.0, 2.0], [1.0])
+
+
+def test_bootstrap_prop_diff_ci_identical_proportions_contains_zero():
+    lo, hi = bootstrap_prop_diff_ci(k_a=20, n_a=30, k_b=20, n_b=30)
+    assert lo <= 0 <= hi
+
+
+def test_bootstrap_prop_diff_ci_detects_real_difference():
+    # 90% vs 30% on reasonably sized samples should clearly exclude 0
+    lo, hi = bootstrap_prop_diff_ci(k_a=9, n_a=30, k_b=27, n_b=30)
+    assert lo > 0
 
 
 def test_parse_kld_log():

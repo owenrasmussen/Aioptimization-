@@ -35,3 +35,38 @@ def bootstrap_diff_ci(a: list[float], b: list[float], stat=statistics.median,
         stat(rng.choices(b, k=len(b))) - stat(rng.choices(a, k=len(a))) for _ in range(n_boot)
     )
     return diffs[int(n_boot * alpha / 2)], diffs[int(n_boot * (1 - alpha / 2)) - 1]
+
+
+def paired_rel_diff_ci(a: list[float], b: list[float], stat=statistics.median,
+                       n_boot: int = 10_000, alpha: float = 0.05, seed: int = 0) -> tuple[float, float]:
+    """CI for stat(b_i/a_i - 1) over PAIRED rounds (a[i] and b[i] are the same
+    round, measured close together in time by interleaving) -- resamples
+    round INDICES, not a and b independently, so the pairing interleaving
+    pays for isn't thrown away the way the unpaired bootstrap_diff_ci would.
+    Relative (not absolute), so it stays meaningful comparing models of very
+    different raw speed. len(a) must equal len(b)."""
+    if len(a) != len(b):
+        raise ValueError(f"paired series must be the same length, got {len(a)} and {len(b)}")
+    n = len(a)
+    rng = random.Random(seed)
+    rel = sorted(
+        stat([b[i] / a[i] - 1 for i in idx])
+        for idx in (rng.choices(range(n), k=n) for _ in range(n_boot))
+    )
+    return rel[int(n_boot * alpha / 2)], rel[int(n_boot * (1 - alpha / 2)) - 1]
+
+
+def bootstrap_prop_diff_ci(k_a: int, n_a: int, k_b: int, n_b: int, n_boot: int = 10_000,
+                           alpha: float = 0.05, seed: int = 0) -> tuple[float, float]:
+    """CI for p_b - p_a, two independent proportions, rebuilt from counts
+    alone (k successes out of n items). Works directly on data already in
+    the DB (quality.score * quality.n_items) -- no per-item records needed,
+    so it applies retroactively to any task-suite score already measured."""
+    rng = random.Random(seed)
+    xs_a = [1] * k_a + [0] * (n_a - k_a)
+    xs_b = [1] * k_b + [0] * (n_b - k_b)
+    diffs = sorted(
+        statistics.fmean(rng.choices(xs_b, k=n_b)) - statistics.fmean(rng.choices(xs_a, k=n_a))
+        for _ in range(n_boot)
+    )
+    return diffs[int(n_boot * alpha / 2)], diffs[int(n_boot * (1 - alpha / 2)) - 1]

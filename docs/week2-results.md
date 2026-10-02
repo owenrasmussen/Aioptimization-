@@ -2,6 +2,14 @@
 
 Oct 1, 2026
 
+> **Correction (Week 4):** the speed comparison below (f16 vs. q8_0 KV
+> cache) was confounded by `flash_attn` differing between the two specs,
+> not just KV type. With that controlled for, q8_0 KV cache is actually
+> *slower*, reversing the conclusion here. The raw numbers below are
+> accurate for what was run; see
+> [docs/week4-results.md](week4-results.md)'s "Corrections to prior weeks"
+> for the corrected, single-variable comparison.
+
 Built the harness's actual contract from [docs/plan.md](plan.md) section 1
 -- a candidate spec in, a result record out -- replacing the Week 1 one-off
 scripts with a single orchestrator, a queryable DuckDB store, and an

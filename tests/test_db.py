@@ -43,7 +43,7 @@ def test_schema_creates_cleanly(tmp_path):
     con = db.connect(str(tmp_path / "test.duckdb"))
     tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
     assert tables == {"specs", "artifacts", "environments", "workloads", "runs", "speed",
-                       "resources", "quality", "failures", "split_files"}
+                       "resources", "quality", "failures", "split_files", "schedule", "checks"}
     con.close()
 
 
@@ -165,6 +165,23 @@ def test_failure_is_recorded(tmp_path):
 
     row = con.execute("SELECT type, message FROM failures WHERE run_id='run1'").fetchone()
     assert row == ("bench", "out of memory")
+    con.close()
+
+
+def test_schedule_and_checks_recorded(tmp_path):
+    con = db.connect(str(tmp_path / "test.duckdb"))
+    record = _sample_record()
+    record["runs"][0]["schedule"] = {"session_id": "sess1", "arm": 0, "round": 3, "order_pos": 1}
+    record["runs"][0]["checks"] = [
+        {"name": "physics_decode", "passed": True, "value": 150.0, "bound": 400.0,
+         "details": {"utilization": 0.375}},
+    ]
+    db.insert_record(con, record)
+
+    sched = con.execute("SELECT session_id, arm, round, order_pos FROM schedule WHERE run_id='run1'").fetchone()
+    assert sched == ("sess1", 0, 3, 1)
+    check = con.execute("SELECT name, passed, value, bound FROM checks WHERE run_id='run1'").fetchone()
+    assert check == ("physics_decode", True, 150.0, 400.0)
     con.close()
 
 

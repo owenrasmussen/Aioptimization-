@@ -55,6 +55,19 @@ def paragraph_hashes(text: str) -> list[str]:
     return [_sha256(p.encode())[:16] for p in paragraphs(text)]
 
 
+def shingles(text: str, n: int = 13) -> set[str]:
+    """Hashed n-word shingles (the standard contamination-detection
+    granularity, e.g. the GPT-3 paper's 13-gram overlap check). Catches
+    leaks exact-paragraph-hash matching misses: two held-out paragraphs
+    merged with no blank line between them, one word edited in an
+    otherwise-copied paragraph, or a held-out sentence pasted into the
+    middle of an unrelated paragraph."""
+    words = text.split()
+    if len(words) < n:
+        return set()
+    return {_sha256(" ".join(words[i:i + n]).encode())[:16] for i in range(len(words) - n + 1)}
+
+
 def _empty_manifest() -> dict:
     return {"version": 1, "text": {}, "tasks": {}}
 
@@ -115,12 +128,13 @@ def load_eval_text(path: Path, manifest: dict, allow_held_out: bool) -> tuple[st
         return text, "held_out", sha_full[:16]
 
     if not allow_held_out and "held_out" in manifest["text"]:
-        held_paras = set(manifest["text"]["held_out"]["paragraph_sha256"])
-        overlap = held_paras & set(paragraph_hashes(text))
-        if overlap:
+        held_entry = manifest["text"]["held_out"]
+        para_overlap = set(held_entry["paragraph_sha256"]) & set(paragraph_hashes(text))
+        shingle_overlap = set(held_entry.get("shingle_sha256", [])) & shingles(text)
+        if para_overlap or shingle_overlap:
             raise HeldOutViolation(
-                f"{path} shares {len(overlap)} paragraph(s) with the held-out split -- "
-                "refusing without --allow-held-out")
+                f"{path} shares {len(para_overlap)} paragraph(s) and {len(shingle_overlap)} "
+                f"13-gram shingle(s) with the held-out split -- refusing without --allow-held-out")
     return text, split, sha_full[:16]
 
 
@@ -165,10 +179,12 @@ def record_text_split(name: str, path: Path, titles: list[str] | None = None,
 
 def lock_held_out(path: Path, titles: list[str] | None = None, revids: list[str] | None = None,
                    manifest_path: Path = MANIFEST_PATH) -> dict:
-    """Locks the held-out split: records its whole-file hash and per-paragraph
-    hashes. Refuses to silently relock a held_out entry to different content
-    (delete the manifest entry yourself first if you really mean to replace it
-    -- that's a deliberate speed bump, not a usability bug)."""
+    """Locks the held-out split: records its whole-file hash, per-paragraph
+    hashes, and 13-gram shingle hashes (computed once here, reused by every
+    load_eval_text call rather than recomputed from the whole held-out file
+    every time). Refuses to silently relock a held_out entry to different
+    content (delete the manifest entry yourself first if you really mean to
+    replace it -- that's a deliberate speed bump, not a usability bug)."""
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else _empty_manifest()
     text = path.read_text(encoding="utf-8")
     sha = _sha256(text.encode())
@@ -179,6 +195,7 @@ def lock_held_out(path: Path, titles: list[str] | None = None, revids: list[str]
     manifest["text"]["held_out"] = {
         "path": str(path), "sha256": sha, "titles": titles or [], "revids": revids or [],
         "paragraph_sha256": paragraph_hashes(text),
+        "shingle_sha256": list(shingles(text)),
         "locked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
