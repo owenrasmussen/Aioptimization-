@@ -106,6 +106,35 @@ def test_shingles_short_text_returns_empty_set():
     assert splits.shingles("too short") == set()
 
 
+def test_paragraphs_drops_concatenated_header_run():
+    # Week 5 live-run bug: consecutive section headers with no blank line
+    # between them (a real Wikipedia extract pattern) concatenate into one
+    # chunk that clears min_words=5 even though every line is boilerplate.
+    text = ("== See also ==\n== References ==\n== Further reading ==\n"
+            "== External links ==\n\nreal sentence with actual content words here.\n")
+    paras = splits.paragraphs(text)
+    assert paras == ["real sentence with actual content words here."]
+
+
+def test_load_eval_text_ignores_shared_header_boilerplate(tmp_path):
+    # Two unrelated articles sharing the same section-header sequence must
+    # NOT be flagged as a held-out leak -- this is exactly the false
+    # positive a live Week 5 run hit before paragraphs()/shingles() learned
+    # to strip header-only lines.
+    manifest_path = tmp_path / "splits.json"
+    headers = "== See also ==\n== References ==\n== Further reading ==\n== External links ==\n"
+    held = _write(tmp_path / "held_out.txt",
+                  f"{headers}\nheld out specific content sentence about zephyrion research today.\n")
+    splits.lock_held_out(held, manifest_path=manifest_path)
+
+    search = _write(tmp_path / "search.txt",
+                     f"{headers}\ncompletely unrelated search content about something else entirely.\n")
+    splits.record_text_split("search", search, manifest_path=manifest_path)
+    manifest = splits.load_manifest(manifest_path)
+    text, split, sha = splits.load_eval_text(search, manifest, allow_held_out=False)
+    assert split == "search"
+
+
 def test_load_eval_text_clean_dev_passes(tmp_path):
     manifest_path = tmp_path / "splits.json"
     held = _write(tmp_path / "held_out.txt", "held out only sentence.\n")

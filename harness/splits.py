@@ -33,22 +33,37 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+_HEADER_LINE_RE = re.compile(r"^\s*=+[^=\n]*=+\s*$")
+
+
 def paragraphs(text: str, min_words: int = 5) -> list[str]:
     """Blank-line-separated, whitespace-normalized chunks -- the unit both
     paragraph hashing (held-out leak detection) and the long-context
     haystack builder work in.
 
-    Drops chunks under min_words: Wikipedia's plain-text extracts are full of
-    structural noise shorter than that -- section headers ("== References
-    =="), bare table-cell fragments left over from infobox markup ("|", "2",
-    "1/2") -- that recur verbatim across any two unrelated articles. Verified
-    live: comparing dev.txt against held_out.txt without this filter flagged
-    157 "shared paragraphs" that were entirely this kind of boilerplate (the
-    longest was 4 words), not real content overlap, which would have made
-    the held-out leak check useless noise. 5 words comfortably exceeds every
-    observed boilerplate fragment while still catching real sentences."""
+    Strips section-header lines ("== References ==") before the word-count
+    filter, then drops what's left if it's under min_words. Two reasons a
+    single filter on raw chunks isn't enough: (1) a lone header is short
+    enough to drop on its own, but several headers with no blank line
+    between them (a real pattern in the Wikipedia extracts, e.g. "==
+    See also ==\\n== References ==\\n== Further reading ==") concatenate
+    into one chunk that clears 5 words while still being 100% boilerplate --
+    caught live when a Week 5 run flagged a held-out "leak" that turned out
+    to be exactly this sequence recurring verbatim across unrelated
+    articles; (2) bare table-cell fragments left over from infobox markup
+    ("|", "2", "1/2") are also structural noise, not real content overlap.
+    Verified live: comparing dev.txt against held_out.txt without any of
+    this filtering flagged 157 "shared paragraphs" that were entirely
+    boilerplate (the longest was 4 words), which would have made the
+    held-out leak check useless noise."""
     parts = re.split(r"\n\s*\n", text)
-    return [" ".join(p.split()) for p in parts if len(p.split()) >= min_words]
+    out = []
+    for p in parts:
+        lines = [ln for ln in p.split("\n") if not _HEADER_LINE_RE.match(ln)]
+        content = " ".join(" ".join(lines).split())
+        if len(content.split()) >= min_words:
+            out.append(content)
+    return out
 
 
 def paragraph_hashes(text: str) -> list[str]:
@@ -61,11 +76,21 @@ def shingles(text: str, n: int = 13) -> set[str]:
     leaks exact-paragraph-hash matching misses: two held-out paragraphs
     merged with no blank line between them, one word edited in an
     otherwise-copied paragraph, or a held-out sentence pasted into the
-    middle of an unrelated paragraph."""
-    words = text.split()
-    if len(words) < n:
-        return set()
-    return {_sha256(" ".join(words[i:i + n]).encode())[:16] for i in range(len(words) - n + 1)}
+    middle of an unrelated paragraph.
+
+    Windows within paragraphs() output, not the raw text: windowing over
+    the raw word stream would re-admit exactly the boilerplate paragraphs()
+    filters out (header-line runs, infobox fragments), which recur verbatim
+    across unrelated articles and produced real false positives in a Week 5
+    live run before this fix. Also avoids manufacturing a shingle that
+    spans the boundary between two unrelated paragraphs."""
+    result: set[str] = set()
+    for para in paragraphs(text):
+        words = para.split()
+        if len(words) < n:
+            continue
+        result.update(_sha256(" ".join(words[i:i + n]).encode())[:16] for i in range(len(words) - n + 1))
+    return result
 
 
 def _empty_manifest() -> dict:
