@@ -78,7 +78,15 @@ class Trial:
 
 
 def build_needle(paragraphs: list[str], para_tokens: list[int], target_tokens: int, depth: float,
-                  seed: int, max_tokens: int = 32, reserve: int = 128) -> Trial:
+                  seed: int, max_tokens: int = 32, reserve: int = 256) -> Trial:
+    """`reserve` must cover everything the token budget check below doesn't
+    see: the inserted needle sentence (not subtracted from `budget`), the
+    question text, and the chat template's own special tokens -- none of
+    which fill_haystack's accounting knows about. Verified live: at
+    target_tokens=32768 (this model's native max), a 128-token reserve
+    still let one multihop trial's real prompt land at 32805 tokens and
+    get rejected by the server as over context -- 256 leaves comfortable
+    margin for needle's smaller overhead too."""
     rng = random.Random(seed)
     topic = rng.choice(_NAME_POOL)
     code = _code(rng)
@@ -93,7 +101,7 @@ def build_needle(paragraphs: list[str], para_tokens: list[int], target_tokens: i
 
 def build_multihop(paragraphs: list[str], para_tokens: list[int], target_tokens: int,
                     depths: tuple[float, float], seed: int, max_tokens: int = 32,
-                    n_distractors: int = 2, reserve: int = 128) -> Trial:
+                    n_distractors: int = 2, reserve: int = 256) -> Trial:
     """Two linked facts (project -> person -> code) at different depths, plus
     distractor chains for other projects. Without distractors, a model could
     answer by finding the only code in the haystack without actually doing
