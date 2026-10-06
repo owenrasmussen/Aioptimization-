@@ -5,3 +5,4 @@ pytest
 duckdb
 lm-eval[api]==0.4.13
 datasets==5.0.1
+matplotlib==3.11.2

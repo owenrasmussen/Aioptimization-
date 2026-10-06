@@ -165,6 +165,20 @@ CREATE TABLE IF NOT EXISTS checks (
   details  JSON,
   PRIMARY KEY (run_id, name)
 );
+
+-- Week 5: tags runs with which grid sweep + stage (gate/full) they belong to,
+-- so a sweep's results can be pulled back out after the fact (harness.pareto)
+-- without needing to remember which sessions/run_dirs were part of it.
+-- Absent for every record before this week (insert_record only writes this
+-- when record.get("sweep") is set).
+CREATE TABLE IF NOT EXISTS sweep_members (
+  run_id     VARCHAR PRIMARY KEY,
+  sweep_id   VARCHAR NOT NULL,
+  stage      VARCHAR NOT NULL,
+  session_id VARCHAR,
+  arm        INTEGER,
+  spec_hash  VARCHAR NOT NULL
+);
 """
 
 
@@ -274,6 +288,14 @@ def insert_record(con: duckdb.DuckDBPyConnection, record: dict) -> None:
                 "INSERT OR REPLACE INTO checks VALUES (?,?,?,?,?,?)",
                 [r["run_id"], c["name"], c["passed"], c.get("value"), c.get("bound"),
                  json.dumps(c.get("details")) if c.get("details") else None],
+            )
+        sweep = record.get("sweep")
+        if sweep:
+            sched = r.get("schedule") or {}
+            con.execute(
+                "INSERT OR REPLACE INTO sweep_members VALUES (?,?,?,?,?,?)",
+                [r["run_id"], sweep["sweep_id"], sweep["stage"], sched.get("session_id"),
+                 sched.get("arm"), record["spec_hash"]],
             )
 
 

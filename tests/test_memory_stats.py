@@ -1,6 +1,9 @@
+import pytest
+
 from harness.memory import ModelShape, kv_cache_bytes
 from harness.kld import parse
-from harness.stats import bootstrap_diff_ci, bootstrap_prop_diff_ci, paired_rel_diff_ci, summarize
+from harness.stats import (bootstrap_diff_ci, bootstrap_prop_diff_ci, paired_rel_diff_ci, spearman,
+                            spearman_ci, summarize)
 
 
 def test_kv_cache_llama3_8b_f16():
@@ -54,6 +57,47 @@ def test_bootstrap_prop_diff_ci_detects_real_difference():
     # 90% vs 30% on reasonably sized samples should clearly exclude 0
     lo, hi = bootstrap_prop_diff_ci(k_a=9, n_a=30, k_b=27, n_b=30)
     assert lo > 0
+
+
+def test_spearman_perfect_positive_correlation():
+    x = [1, 2, 3, 4, 5, 6, 7, 8]
+    y = [10, 20, 30, 40, 50, 60, 70, 80]
+    assert spearman(x, y) == pytest.approx(1.0)
+
+
+def test_spearman_perfect_negative_correlation():
+    x = [1, 2, 3, 4, 5, 6, 7, 8]
+    y = [80, 70, 60, 50, 40, 30, 20, 10]
+    assert spearman(x, y) == pytest.approx(-1.0)
+
+
+def test_spearman_handles_ties():
+    x = [1, 1, 2, 2, 3, 3]
+    y = [1, 2, 1, 2, 1, 2]  # no monotonic relationship once tied
+    rho = spearman(x, y)
+    assert -0.3 < rho < 0.3
+
+
+def test_spearman_ci_strong_correlation_excludes_zero():
+    x = list(range(15))
+    y = [v + 0.1 * (i % 2) for i, v in enumerate(x)]  # near-perfect monotonic, tiny noise
+    result = spearman_ci(x, y)
+    assert result["rho"] > 0.9
+    assert result["ci"][0] > 0.5  # CI excludes 0
+
+
+def test_spearman_ci_no_correlation_contains_zero():
+    import random
+    rng = random.Random(42)
+    x = [rng.random() for _ in range(30)]
+    y = [rng.random() for _ in range(30)]  # independently drawn -- genuinely no relationship
+    result = spearman_ci(x, y)
+    assert result["ci"][0] <= 0 <= result["ci"][1]
+
+
+def test_spearman_requires_equal_length():
+    with pytest.raises(ValueError):
+        spearman([1, 2], [1])
 
 
 def test_parse_kld_log():

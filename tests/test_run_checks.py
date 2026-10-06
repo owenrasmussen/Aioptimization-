@@ -91,6 +91,30 @@ def test_measure_bench_marks_invalid_on_impossible_speed():
 
 
 @requires_model
+def test_ensure_artifact_computes_n_params_and_bpw_from_gguf():
+    # Week 5: a --no-bench gate stage never runs llama-bench, so n_params/bpw
+    # must come from the GGUF directly, not be left to a bench record that
+    # might never exist.
+    artifact = run_mod.ensure_artifact(_SPEC, MODEL_PATH.parent / "cache", Path(tempfile.mkdtemp()),
+                                        "third_party/llama.cpp/build/bin")
+    assert artifact["n_params"] is not None
+    assert 3_000_000_000 < artifact["n_params"] < 4_000_000_000  # Qwen2.5-3B
+    assert 4.5 < artifact["bpw"] < 5.5  # Q4_K_M is ~4.9-4.95 bpw on this model
+
+
+def test_ensure_artifact_raises_on_quant_missing_from_file_type_map(tmp_path):
+    # Week 5 fix: a quant missing from _QUANT_FILE_TYPE must fail loudly, not
+    # silently skip the Week 4 cache-poisoning check for exactly the quants
+    # nobody's added an entry for yet.
+    spec = CandidateSpec(base_model="models/qwen2.5-3b-instruct-f16.gguf", quant="IQ4_XS", ctx=8192)
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / f"{spec.artifact_hash}.gguf").write_bytes(b"not a real gguf, just needs to exist")
+    with pytest.raises(ValueError, match="no entry in _QUANT_FILE_TYPE"):
+        run_mod.ensure_artifact(spec, cache_dir, tmp_path, "third_party/llama.cpp/build/bin")
+
+
+@requires_model
 def test_measure_bench_passes_honest_speed():
     run_dir = Path(tempfile.mkdtemp())
     bandwidth = physics.peak_bandwidth_gbps()

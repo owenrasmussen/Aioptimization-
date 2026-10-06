@@ -1,0 +1,13 @@
+{
+  "base_model": "models\\qwen2.5-3b-instruct-f16.gguf",
+  "batch_size": null,
+  "ctx": 32768,
+  "engine_flags": [],
+  "flash_attn": true,
+  "imatrix": null,
+  "kv_type_k": "f16",
+  "kv_type_v": "f16",
+  "quant": "Q8_0",
+  "tensor_overrides": {},
+  "ubatch_size": null
+}

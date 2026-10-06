@@ -29,14 +29,15 @@ def _insert_spec(con, spec_hash, overrides=None):
                  json.dumps(base)])
 
 
-def _insert_quality(con, run_id, spec_hash, env_id, eval_name, score, n_items, started_at="2026-10-01T00:00:00"):
-    wl = f"wl_{eval_name}"
+def _insert_quality(con, run_id, spec_hash, env_id, eval_name, score, n_items,
+                     started_at="2026-10-01T00:00:00", split="dev", kl_mean=None):
+    wl = f"wl_{eval_name}_{split}_{run_id}"
     con.execute("INSERT OR IGNORE INTO workloads VALUES (?,?,?,?,?,?,?)",
                 [wl, "lmeval", None, None, None, 1, json.dumps({})])
     con.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [run_id, spec_hash, env_id, wl, 0, None, 60, 1800, started_at, 1.0, "ok", None, None])
     con.execute("INSERT OR REPLACE INTO quality VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                [run_id, eval_name, "dev", score, None, None, None, None, n_items, None, None])
+                [run_id, eval_name, split, score, kl_mean, None, None, None, n_items, None, None])
 
 
 def _setup(con):
@@ -115,8 +116,24 @@ def test_compare_session_reports_quality_delta(tmp_path):
     _insert_quality(con, "q_a", "spec_a", "env1", "gsm8k", 0.70, 30)
     _insert_quality(con, "q_b", "spec_b", "env1", "gsm8k", 0.30, 30)  # clearly worse
     result = compare.compare_session(con, "sessD", baseline_arm=0)
-    q = result["arms"][1]["quality"]["gsm8k"]
+    q = result["arms"][1]["quality"]["gsm8k@dev"]
     assert q["prop_diff_ci"][1] < 0  # arm's score is lower, CI should exclude 0 on the high side
+    con.close()
+
+
+def test_latest_quality_keyed_by_eval_name_and_split_not_eval_name_alone(tmp_path):
+    # Week 5 bug: a cheap gate-split KL and a full dev-split KL sharing an
+    # eval_name must not overwrite each other in analysis -- _latest_quality
+    # has to key on (eval_name, split), not eval_name alone.
+    con = db.connect(str(tmp_path / "t.duckdb"))
+    _setup(con)
+    _insert_quality(con, "q_gate", "spec_a", "env1", "kld_c512_n20", None, None,
+                     split="search", kl_mean=0.10, started_at="2026-10-01T00:00:00")
+    _insert_quality(con, "q_full", "spec_a", "env1", "kld_c512_n20", None, None,
+                     split="dev", kl_mean=0.05, started_at="2026-10-01T01:00:00")
+    latest = compare._latest_quality(con, "spec_a")
+    assert latest[("kld_c512_n20", "search")]["kl_mean"] == 0.10
+    assert latest[("kld_c512_n20", "dev")]["kl_mean"] == 0.05
     con.close()
 
 

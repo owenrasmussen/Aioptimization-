@@ -61,27 +61,50 @@ def _actual_file_type(gguf_path: Path) -> int | None:
     return None if f is None else int(f.parts[f.data[0]][0])
 
 
+def _gguf_params_and_bpw(gguf_path: Path) -> tuple[int, float]:
+    """n_params and bits-per-weight computed directly from the GGUF's own
+    tensor metadata, not from llama-bench's JSON -- a gate-only (--no-bench)
+    stage never runs llama-bench at all, and artifacts.n_params/bpw are
+    written with INSERT OR IGNORE, so relying on bench output would leave
+    them permanently NULL for any artifact whose first measurement skipped
+    bench."""
+    from gguf import GGUFReader
+
+    r = GGUFReader(gguf_path)
+    n_params = sum(t.n_elements for t in r.tensors)
+    total_bytes = sum(t.n_bytes for t in r.tensors)
+    return n_params, total_bytes * 8 / n_params
+
+
 def ensure_artifact(spec: CandidateSpec, cache_dir: Path, log_dir: Path, bin_dir: str) -> dict:
     """Build (or reuse) the weights file for spec.artifact_hash. This *is* the
     artifact cache: a file at the expected path means it's already built --
     but a cache hit also checks the file's actual GGUF quant type against
     spec.quant (Week 4 red-team finding: nothing previously stopped a wrong
     file, e.g. a Q3_K_M copied over a Q4_K_M cache path, from being silently
-    measured and reported under the wrong label)."""
+    measured and reported under the wrong label). Raises on a quant missing
+    from _QUANT_FILE_TYPE rather than silently skipping the check -- a
+    missing map entry should fail loud, not quietly turn the check off for
+    exactly the quants nobody's verified it against yet."""
     if spec.quant in ("F16", "BF16"):
         path = Path(spec.base_model)
-        return {"path": str(path), "size_bytes": path.stat().st_size,
+        n_params, bpw = _gguf_params_and_bpw(path)
+        return {"path": str(path), "size_bytes": path.stat().st_size, "n_params": n_params, "bpw": bpw,
                 "build_seconds": None, "build_cmd": None, "built_at": None}
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     dst = cache_dir / f"{spec.artifact_hash}.gguf"
     if dst.exists():
-        expected = _QUANT_FILE_TYPE.get(spec.quant)
+        if spec.quant not in _QUANT_FILE_TYPE:
+            raise ValueError(f"quant {spec.quant!r} has no entry in _QUANT_FILE_TYPE -- add one "
+                              f"before using it, so cache-poisoning detection isn't silently skipped")
         actual = _actual_file_type(dst)
-        if expected is not None and actual is not None and actual != expected:
-            raise ValueError(f"cached artifact {dst} has file_type={actual}, expected {expected} "
-                              f"for quant={spec.quant!r} -- the cache is poisoned or stale, delete it")
-        return {"path": str(dst), "size_bytes": dst.stat().st_size,
+        if actual is not None and actual != _QUANT_FILE_TYPE[spec.quant]:
+            raise ValueError(f"cached artifact {dst} has file_type={actual}, expected "
+                              f"{_QUANT_FILE_TYPE[spec.quant]} for quant={spec.quant!r} -- "
+                              f"the cache is poisoned or stale, delete it")
+        n_params, bpw = _gguf_params_and_bpw(dst)
+        return {"path": str(dst), "size_bytes": dst.stat().st_size, "n_params": n_params, "bpw": bpw,
                 "build_seconds": None, "build_cmd": None, "built_at": None}
 
     if spec.tensor_overrides or spec.imatrix:
@@ -89,7 +112,9 @@ def ensure_artifact(spec: CandidateSpec, cache_dir: Path, log_dir: Path, bin_dir
 
     log_path = log_dir / f"quantize_{spec.artifact_hash}.log"
     build_seconds = llama.quantize(Path(spec.base_model), dst, spec.quant, log_path, bin_dir=bin_dir)
-    return {"path": str(dst), "size_bytes": dst.stat().st_size, "build_seconds": build_seconds,
+    n_params, bpw = _gguf_params_and_bpw(dst)
+    return {"path": str(dst), "size_bytes": dst.stat().st_size, "n_params": n_params, "bpw": bpw,
+            "build_seconds": build_seconds,
             "build_cmd": f"llama-quantize {spec.base_model} {dst} {spec.quant}",
             "built_at": dt.datetime.now(dt.timezone.utc).isoformat()}
 
@@ -216,10 +241,17 @@ def measure_bench(spec: CandidateSpec, artifact_path: Path, kind: str, pp: int, 
 def measure_kld(spec: CandidateSpec, artifact_path: Path, ref: Path, text: Path, text_hash: str,
                  split: str, ctx: int, chunks: int | None, cache_dir: Path, run_dir: Path,
                  max_temp: int, bin_dir: str) -> dict:
+    # eval_name/log name include ctx and chunks: a spec measured at two KL
+    # fidelities (e.g. a cheap gate pass and a later full pass) would
+    # otherwise collide under the single name "kld" -- the second overwrites
+    # the first both in the quality table (same (run_id, eval_name) isn't
+    # the issue; it's that compare's "latest by eval_name" lookup can't tell
+    # them apart) and on disk (both write to the same kld.log).
+    eval_name = f"kld_c{ctx}_n{chunks or 0}"
     workload = {"kind": "kld", "ref": ref.name, "prompt_set_hash": text_hash, "split": split,
                 "input_len": ctx, "output_len": 0, "concurrency": 1, "chunks": chunks}
     workload_id = _hash_dict(workload)
-    entry, log_path = _new_run_entry(workload_id, workload, 0, run_dir, "kld", max_temp)
+    entry, log_path = _new_run_entry(workload_id, workload, 0, run_dir, eval_name, max_temp)
     t0 = time.monotonic()
     ref_base = cache_dir / f"ref_{ref.stem}_{text_hash}_c{ctx}_n{chunks or 0}.kld"
     try:
@@ -228,7 +260,7 @@ def measure_kld(spec: CandidateSpec, artifact_path: Path, ref: Path, text: Path,
             kld = llama.kl_divergence(artifact_path, ref_base, text, ctx, llama.spec_flags(spec), log_path,
                                        chunks=chunks, bin_dir=bin_dir)
         entry["wall_seconds"] = time.monotonic() - t0
-        entry["quality"] = {"eval_name": "kld", "split": split, "score": kld.get("ppl"),
+        entry["quality"] = {"eval_name": eval_name, "split": split, "score": kld.get("ppl"),
                              "kl_mean": kld.get("kld_mean"), "kl_p99": kld.get("kld_p99"),
                              "kl_max": kld.get("kld_max"), "top1_agree_pct": kld.get("top1_agree_pct")}
         entry["resources"] = sampler.summary()
@@ -399,12 +431,18 @@ def bench_interleaved(arms: list[Arm], session_id: str, args: argparse.Namespace
 
 
 def run_quality(arm: Arm, args: argparse.Namespace) -> None:
-    if not args.no_kld:
+    if args.kld:
         kld_path = Path(args.kld_text)
         _, kld_split, kld_text_hash = _load_eval_text(kld_path, args.allow_held_out)
-        arm.quality_runs.append(measure_kld(arm.spec, arm.artifact_path, Path(args.kld_ref), kld_path,
-                                             kld_text_hash, kld_split, args.kld_ctx, args.kld_chunks,
-                                             Path(args.cache_dir), arm.run_dir, args.max_temp, args.bin_dir))
+        # --kld is repeatable (CTX:CHUNKS), so one spec can be KL-measured at
+        # multiple fidelities in one run -- e.g. a cheap gate-stage check and
+        # a full survivor check both land in the same record. measure_kld's
+        # eval_name already bakes in ctx/chunks, so these don't collide.
+        for ctx, chunks in args.kld:
+            arm.quality_runs.append(measure_kld(arm.spec, arm.artifact_path, Path(args.kld_ref), kld_path,
+                                                 kld_text_hash, kld_split, ctx, chunks,
+                                                 Path(args.cache_dir), arm.run_dir, args.max_temp,
+                                                 args.bin_dir))
     if args.lm_eval_tasks:
         arm.quality_runs += measure_lm_eval(arm.spec, arm.artifact_path, args.lm_eval_tasks,
                                              args.eval_split, args.allow_held_out, args.lm_eval_limit,
@@ -418,21 +456,19 @@ def run_quality(arm: Arm, args: argparse.Namespace) -> None:
 
 
 def write_record(arm: Arm, env: dict, env_id: str, args: argparse.Namespace) -> dict:
+    # n_params/bpw now come straight from ensure_artifact (computed from the
+    # GGUF's own tensor metadata), not scavenged from a bench record's JSON --
+    # a --no-bench gate stage never runs llama-bench, so that fallback would
+    # have left them permanently NULL (artifacts is INSERT OR IGNORE, no
+    # second chance to fill them in later).
     runs = arm.bench_runs + arm.quality_runs
-    n_params = bpw = None
-    for r in runs:
-        raw = (r.get("speed") or {}).get("raw")
-        if raw and raw.get("model_n_params"):
-            n_params = raw["model_n_params"]
-            bpw = raw["model_size"] * 8 / raw["model_n_params"]
-            break
-
     record = {
-        "record_version": 3, "spec_hash": arm.spec.spec_hash, "artifact_hash": arm.spec.artifact_hash,
-        "env_id": env_id, "spec": arm.spec.to_dict(),
-        "artifact": {**arm.artifact, "n_params": n_params, "bpw": bpw},
+        "record_version": 4, "spec_hash": arm.spec.spec_hash, "artifact_hash": arm.spec.artifact_hash,
+        "env_id": env_id, "spec": arm.spec.to_dict(), "artifact": arm.artifact,
         "environment": env, "runs": runs,
     }
+    if getattr(args, "sweep_id", None):
+        record["sweep"] = {"sweep_id": args.sweep_id, "stage": args.stage}
     (arm.run_dir / "record.json").write_text(json.dumps(record, indent=2, default=str))
     con = db.connect(args.db)
     db.insert_record(con, record)
@@ -455,11 +491,15 @@ def main() -> None:
     ap.add_argument("--cache-dir", default="models/cache")
     ap.add_argument("--out", default="results/runs")
     ap.add_argument("--db", default=db.DB_PATH)
+    ap.add_argument("--no-bench", action="store_true",
+                     help="skip the interleaved bench phase (gate stages: quality only)")
     ap.add_argument("--no-kld", action="store_true")
     ap.add_argument("--kld-ref", help="reference model for KL divergence (required unless --no-kld)")
     ap.add_argument("--kld-text", help="eval text file (required unless --no-kld)")
-    ap.add_argument("--kld-ctx", type=int, default=512)
-    ap.add_argument("--kld-chunks", type=int, default=50)
+    ap.add_argument("--kld", action="append", metavar="CTX:CHUNKS", default=None,
+                     help="repeatable -- one KL measurement per entry, e.g. --kld 512:50 --kld 16384:2 "
+                          "(default: 512:50). Each gets its own eval_name, so a spec can be KL-measured "
+                          "at multiple fidelities in one run without the results colliding.")
     ap.add_argument("--eval-split", choices=list(splits.SPLITS), default="dev",
                      help="which split's docs to use for lm-eval tasks (default: dev)")
     ap.add_argument("--allow-held-out", action="store_true",
@@ -472,17 +512,29 @@ def main() -> None:
     ap.add_argument("--longctx-lengths", type=int, nargs="+", default=[8192, 16384, 32768])
     ap.add_argument("--longctx-seeds", type=int, default=2, help="number of seeds per (kind, length)")
     ap.add_argument("--longctx-text", help="haystack text file (default: --kld-text)")
+    ap.add_argument("--sweep-id", help="tag written into the record/DB for later grid analysis (optional)")
+    ap.add_argument("--stage", default=None, help="e.g. 'gate' or 'full' -- only meaningful with --sweep-id")
     args = ap.parse_args()
     args.lm_eval_tasks = [t.strip() for t in args.lm_eval_tasks.split(",") if t.strip()]
+    if args.no_kld:
+        args.kld = []  # --no-kld always wins, even if --kld was also (contradictorily) passed
+    else:
+        entries = args.kld if args.kld is not None else ["512:50"]
+        args.kld = []
+        for entry in entries:
+            ctx_s, _, chunks_s = entry.partition(":")
+            args.kld.append((int(ctx_s), int(chunks_s) if chunks_s else None))
 
-    if not args.no_kld and not (args.kld_ref and args.kld_text):
+    if args.kld and not (args.kld_ref and args.kld_text):
         ap.error("--kld-ref and --kld-text are required unless --no-kld")
     if args.run_longctx and not (args.longctx_text or args.kld_text):
         ap.error("--run-longctx needs --longctx-text or --kld-text to source the haystack")
     if args.eval_split == "held_out" and not args.allow_held_out:
         ap.error("--eval-split held_out requires --allow-held-out")
-    if args.repeats < 5:
+    if not args.no_bench and args.repeats < 5:
         ap.error("--repeats must be at least 5 (docs/plan.md section 4: 'run at least 5 repeats')")
+    if args.sweep_id and not args.stage:
+        ap.error("--sweep-id requires --stage")
 
     session_id = uuid4().hex[:8]
     env = gpu.environment()
@@ -491,9 +543,10 @@ def main() -> None:
     env_id = _hash_dict(stable)
 
     arms = [prepare_arm(i, Path(p), session_id, args) for i, p in enumerate(args.specs)]
-    bench_interleaved(arms, session_id, args)
-    for arm in arms:
-        write_record(arm, stable, env_id, args)  # bench-only checkpoint
+    if not args.no_bench:
+        bench_interleaved(arms, session_id, args)
+        for arm in arms:
+            write_record(arm, stable, env_id, args)  # bench-only checkpoint
     for arm in arms:
         run_quality(arm, args)
         write_record(arm, stable, env_id, args)  # full record

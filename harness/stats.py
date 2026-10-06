@@ -70,3 +70,54 @@ def bootstrap_prop_diff_ci(k_a: int, n_a: int, k_b: int, n_b: int, n_boot: int =
         for _ in range(n_boot)
     )
     return diffs[int(n_boot * alpha / 2)], diffs[int(n_boot * (1 - alpha / 2)) - 1]
+
+
+def _ranks(xs: list[float]) -> list[float]:
+    """1-indexed ranks, ties given the average rank of the tied block --
+    the standard definition Spearman's rho is built on."""
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    ranks = [0.0] * len(xs)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+            j += 1
+        avg_rank = (i + j) / 2 + 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float:
+    mx, my = statistics.fmean(xs), statistics.fmean(ys)
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    return cov / (vx * vy) ** 0.5 if vx and vy else 0.0
+
+
+def spearman(x: list[float], y: list[float]) -> float:
+    """Spearman rank correlation (Pearson correlation of the ranks, average
+    ranks for ties). Pure Python -- no scipy, no numpy."""
+    if len(x) != len(y):
+        raise ValueError(f"x and y must be the same length, got {len(x)} and {len(y)}")
+    return _pearson(_ranks(x), _ranks(y))
+
+
+def spearman_ci(x: list[float], y: list[float], n_boot: int = 10_000, alpha: float = 0.05,
+                seed: int = 0) -> dict:
+    """{"rho": ..., "ci": (lo, hi), "n": ...} -- the actual answer to "does
+    metric x predict the ranking of metric y", with an honest interval
+    rather than a single number eyeballed off a plot. Resamples CONFIGS
+    (paired x[i]/y[i]), not x and y independently -- the two metrics must
+    stay matched to the same underlying config in every bootstrap draw."""
+    n = len(x)
+    rho = spearman(x, y)
+    rng = random.Random(seed)
+    boots = sorted(
+        spearman([x[i] for i in idx], [y[i] for i in idx])
+        for idx in (rng.choices(range(n), k=n) for _ in range(n_boot))
+    )
+    lo, hi = boots[int(n_boot * alpha / 2)], boots[int(n_boot * (1 - alpha / 2)) - 1]
+    return {"rho": rho, "ci": (lo, hi), "n": n}

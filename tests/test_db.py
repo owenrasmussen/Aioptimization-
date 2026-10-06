@@ -43,7 +43,8 @@ def test_schema_creates_cleanly(tmp_path):
     con = db.connect(str(tmp_path / "test.duckdb"))
     tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
     assert tables == {"specs", "artifacts", "environments", "workloads", "runs", "speed",
-                       "resources", "quality", "failures", "split_files", "schedule", "checks"}
+                       "resources", "quality", "failures", "split_files", "schedule", "checks",
+                       "sweep_members"}
     con.close()
 
 
@@ -182,6 +183,29 @@ def test_schedule_and_checks_recorded(tmp_path):
     assert sched == ("sess1", 0, 3, 1)
     check = con.execute("SELECT name, passed, value, bound FROM checks WHERE run_id='run1'").fetchone()
     assert check == ("physics_decode", True, 150.0, 400.0)
+    con.close()
+
+
+def test_sweep_members_recorded_when_record_has_sweep_tag(tmp_path):
+    con = db.connect(str(tmp_path / "test.duckdb"))
+    record = _sample_record()
+    record["sweep"] = {"sweep_id": "w5", "stage": "gate"}
+    record["runs"][0]["schedule"] = {"session_id": "sess1", "arm": 2, "round": 0, "order_pos": 0}
+    db.insert_record(con, record)
+
+    row = con.execute("SELECT sweep_id, stage, session_id, arm, spec_hash FROM sweep_members "
+                       "WHERE run_id='run1'").fetchone()
+    assert row == ("w5", "gate", "sess1", 2, "spec0000000000ab")
+    con.close()
+
+
+def test_sweep_members_absent_for_records_without_sweep_tag(tmp_path):
+    # v3-and-earlier records (no "sweep" key) must still replay cleanly --
+    # record.get("sweep") returns None and insert_record skips the insert,
+    # not a KeyError.
+    con = db.connect(str(tmp_path / "test.duckdb"))
+    db.insert_record(con, _sample_record())  # no "sweep" key at all
+    assert con.execute("SELECT count(*) FROM sweep_members").fetchone()[0] == 0
     con.close()
 
 

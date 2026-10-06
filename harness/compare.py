@@ -43,17 +43,24 @@ def session_rows(con, session_id: str) -> list[tuple]:
     """, [session_id]).fetchall()
 
 
-def _latest_quality(con, spec_hash: str) -> dict[str, dict]:
+def _latest_quality(con, spec_hash: str) -> dict[tuple[str, str], dict]:
+    """Keyed on (eval_name, split), not eval_name alone: a cheap gate-split
+    KL and a full dev-split KL can legitimately share an eval_name (same
+    ctx/chunks, different split) without one overwriting the other here --
+    eval_name alone already distinguishes most KL fidelities (measure_kld
+    bakes ctx/chunks into the name), but split is the second axis that can
+    still collide without this."""
     rows = con.execute("""
-        SELECT q.eval_name, q.score, q.n_items, q.kl_mean, r.started_at
+        SELECT q.eval_name, q.split, q.score, q.n_items, q.kl_mean, r.started_at
         FROM quality q JOIN runs r ON q.run_id = r.run_id
         WHERE r.spec_hash = ?
         ORDER BY r.started_at DESC
     """, [spec_hash]).fetchall()
     out = {}
-    for eval_name, score, n_items, kl_mean, _ in rows:
-        if eval_name not in out:  # first (most recent) row wins
-            out[eval_name] = {"score": score, "n_items": n_items, "kl_mean": kl_mean}
+    for eval_name, split, score, n_items, kl_mean, _ in rows:
+        key = (eval_name, split)
+        if key not in out:  # first (most recent) row wins
+            out[key] = {"score": score, "n_items": n_items, "kl_mean": kl_mean}
     return out
 
 
@@ -134,20 +141,21 @@ def compare_session(con, session_id: str, baseline_arm: int = 0, alpha: float = 
             entry["quality"] = "QUALITY UNVERIFIED"
         else:
             q = {}
-            for eval_name, aq in arm_quality.items():
-                bq = base_quality.get(eval_name)
+            for (eval_name, split), aq in arm_quality.items():
+                key = f"{eval_name}@{split}"
+                bq = base_quality.get((eval_name, split))
                 if bq and aq.get("n_items") and bq.get("n_items") and aq.get("score") is not None \
                         and bq.get("score") is not None:
                     k_a = round(bq["score"] * bq["n_items"])
                     k_b = round(aq["score"] * aq["n_items"])
                     lo, hi = stats.bootstrap_prop_diff_ci(k_a, bq["n_items"], k_b, aq["n_items"], alpha=alpha)
-                    q[eval_name] = {"baseline_score": bq["score"], "arm_score": aq["score"],
-                                     "prop_diff_ci": [lo, hi]}
+                    q[key] = {"baseline_score": bq["score"], "arm_score": aq["score"],
+                              "prop_diff_ci": [lo, hi]}
                 elif aq.get("kl_mean") is not None:
-                    q[eval_name] = {"baseline_kl_mean": bq.get("kl_mean") if bq else None,
-                                     "arm_kl_mean": aq["kl_mean"]}
+                    q[key] = {"baseline_kl_mean": bq.get("kl_mean") if bq else None,
+                              "arm_kl_mean": aq["kl_mean"]}
                 else:
-                    q[eval_name] = aq
+                    q[key] = aq
             entry["quality"] = q
         result["arms"][arm] = entry
     return result
