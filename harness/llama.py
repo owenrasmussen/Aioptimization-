@@ -35,10 +35,48 @@ def bin_path(name: str, bin_dir: str | None = None) -> str:
     return str(exe)  # let the OS raise a clear "not found" on exec
 
 
+def _cuda_bin_dirs() -> list[str]:
+    """CUDA's DLL directory, so ggml-cuda.dll's runtime deps (cudart64_*,
+    cublas64_*, ...) resolve even in a shell that never sourced the CUDA
+    installer's PATH change -- confirmed live: a fresh shell launching these
+    binaries directly failed with STATUS_DLL_NOT_FOUND even though the exact
+    same binaries had just quantized a model successfully moments earlier in
+    a shell that did have the PATH set. CUDA 12.x ships its DLLs in bin/
+    directly; 13.x moved them to bin/x64 (same layout change
+    scripts/setup_llamacpp.sh already works around at build time) -- check
+    both rather than assuming one."""
+    roots = []
+    cuda_path = os.environ.get("CUDA_PATH")
+    if cuda_path:
+        roots.append(Path(cuda_path))
+    base = Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA")
+    if base.is_dir():
+        roots += sorted(base.glob("v*"), reverse=True)
+    out = []
+    for root in roots:
+        for sub in (root / "bin" / "x64", root / "bin"):
+            if sub.is_dir() and str(sub) not in out:
+                out.append(str(sub))
+    return out
+
+
+def subprocess_env() -> dict:
+    """os.environ with CUDA's DLL directory prepended to PATH -- every
+    launch of a llama.cpp binary (llama.py's run() and server.py's
+    LlamaServer Popen alike) must go through this, not os.environ directly,
+    or it silently works in whichever shell happens to have CUDA on PATH
+    and fails everywhere else."""
+    env = os.environ.copy()
+    extra = _cuda_bin_dirs()
+    if extra:
+        env["PATH"] = os.pathsep.join(extra) + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def run(cmd: list[str], log_path: Path) -> subprocess.CompletedProcess:
     """Run cmd, always writing a log (command line + stdout + stderr). Raises RunFailed on nonzero exit."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = subprocess.run(cmd, capture_output=True, text=True, env=subprocess_env())
     log_path.write_text("$ " + shlex.join(cmd) + "\n" + p.stdout + p.stderr)
     if p.returncode != 0:
         raise RunFailed(cmd, log_path, p.returncode)
@@ -97,15 +135,21 @@ def bench(model: Path, pp: int, tg: int, reps: int, flags: list[str], log_path: 
 
 def reference_logits(ref: Path, text: Path, ctx: int, out_path: Path, chunks: int | None = None,
                       bin_dir: str | None = None) -> Path:
-    """Save reference logits for KL comparison, if not already saved at out_path."""
+    """Save reference logits for KL comparison, if not already saved at out_path.
+    Writes to a .tmp path and renames on success (same pattern as quantize()):
+    reference files are multi-GB and this is a long-running subprocess, so a
+    crash or kill partway through must not leave a partial file sitting at
+    out_path looking like a valid, complete cache entry."""
     if out_path.exists():
         return out_path
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     exe = bin_path("llama-perplexity", bin_dir)
     cmd = [exe, "-m", str(ref), "-f", str(text), "-c", str(ctx), "-ngl", "99"]
     if chunks:
         cmd += ["--chunks", str(chunks)]
-    cmd += ["--kl-divergence-base", str(out_path)]
+    cmd += ["--kl-divergence-base", str(tmp)]
     run(cmd, out_path.with_suffix(".ref.log"))
+    os.replace(tmp, out_path)
     return out_path
 
 

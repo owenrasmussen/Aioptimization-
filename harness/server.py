@@ -69,7 +69,8 @@ class LlamaServer:
         self._log_fh = open(self.log_path, "w", encoding="utf-8")
         self._log_fh.write("$ " + subprocess.list2cmdline(cmd) + "\n")
         self._log_fh.flush()
-        self._proc = subprocess.Popen(cmd, stdout=self._log_fh, stderr=subprocess.STDOUT)
+        self._proc = subprocess.Popen(cmd, stdout=self._log_fh, stderr=subprocess.STDOUT,
+                                       env=llama.subprocess_env())
 
         deadline = time.monotonic() + self.startup_timeout_s
         while time.monotonic() < deadline:
